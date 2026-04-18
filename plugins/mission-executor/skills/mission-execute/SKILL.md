@@ -25,6 +25,32 @@ Fully automated execution of Factory/droid missions. Reads the mission spec, dec
 
 ## Pipeline (7 phases)
 
+### Phase 0: VALIDATE (hard gate)
+
+Before doing anything else, run schema + cross-reference validation against the
+mission directory. This catches malformed `features.json` / `validation-state.json`
+/ `state.json` before any downstream script corrupts them further.
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/validate-mission.mjs" "$MISSION_PATH"
+```
+
+The combined validator runs:
+1. Native JS schema checks (always) -- port of Factory's `mission_contracts.py`
+2. Factory's Python harness `python3 -m scripts.harness.check_missions` when
+   the harness exists in an ancestor directory (graceful skip otherwise)
+
+**Exit on any ERROR.** Warnings are advisory and may indicate:
+- `missing validatedAtMilestone` -- passed assertions recorded without
+  attribution. Fix by rewriting with `record-assertion.mjs`.
+- `mission completion state diverges from feature completion` -- state.json
+  says `completed` but features aren't all `completed` (or vice versa). Phase
+  7 must reconcile before marking done.
+- `worker session references do not resolve` -- harmless until a retention
+  policy exists.
+
+**Never proceed past Phase 0 with schema errors.** Fix manually, then re-run.
+
 ### Phase 1: INGEST
 
 Read and parse the mission directory:
@@ -166,10 +192,14 @@ For each assertion in validation-contract.md:
    - `curl`: Execute the HTTP request, check response shape
    - `cli-binary`: Run the CLI command, check exit code + output
    - `tuistory`: Launch TUI via tuistory, navigate, capture snapshot, check content
-3. Record result to validation-state.json:
-   ```json
-   {"VAL-XXX-NNN": {"status": "passed", "evidence": "..."}}
+3. Record result via the helper (never hand-write validation-state.json):
+   ```bash
+   node "${CLAUDE_PLUGIN_ROOT}/scripts/record-assertion.mjs" "$MISSION_PATH" \
+     --id=VAL-XXX-NNN --status=passed --evidence="..."
    ```
+   The helper sets `validatedAtMilestone` automatically from the feature's
+   `fulfills` mapping. Hand-writing skips this field and fails Factory's
+   harness check.
 4. Write detailed evidence to `.omc/validation/{assertion-id}.md`
 
 **Verification workers**: Spawn up to 3 parallel validators:
@@ -206,12 +236,19 @@ For each FAIL from the critic:
 
 ### Phase 7: COMPLETE
 
-1. Update mission `state.json`: set state to reflect completion
-2. Ensure `validation-state.json` has all assertions as "passed"
-3. Append completion entry to `progress_log.jsonl`
-4. Write execution summary to mission directory
-5. Clean up temporary files (.omc/skills/mission-worker-*, .omc/validation/)
-6. Report final status to user
+1. Ensure every feature in `features.json` has `status: "completed"`
+   (otherwise mission-state/feature-state divergence will fire)
+2. Update mission `state.json`: set `state: "completed"`
+3. Ensure `validation-state.json` has all assertions as `"passed"` with
+   `validatedAtMilestone` populated (Phase 4 helper does this)
+4. Append completion entry to `progress_log.jsonl`
+5. Write execution summary to mission directory
+6. Clean up temporary files (`.omc/skills/mission-worker-*`, `.omc/validation/`)
+7. **Re-run Phase 0 validation as a gate**. Must exit with zero errors:
+   ```bash
+   node "${CLAUDE_PLUGIN_ROOT}/scripts/validate-mission.mjs" "$MISSION_PATH"
+   ```
+8. Report final status to user
 
 ## Lessons Encoded (from real execution)
 

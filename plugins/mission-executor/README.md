@@ -21,14 +21,15 @@ Full autopilot execution of Factory/droid missions with parallel teams, independ
 
 ## Pipeline Phases
 
+0. VALIDATE: Schema + cross-reference checks (JS + Factory's Python harness). Hard gate on errors
 1. INGEST: Parse features.json, validation-contract.md, AGENTS.md
 1.5. RECONCILE: Detect zombies + external work already in git HEAD. Skip execution for features already complete
 2. DECOMPOSE: Group remaining features into parallel batches by milestone + code-path independence
 3. EXECUTE: Spawn team workers per batch, monitor, shutdown, sync features.json from git
-4. VERIFY: Run each assertion independently (unit-test, curl, cli-binary, tuistory)
+4. VERIFY: Run each assertion independently (unit-test, curl, cli-binary, tuistory); record via record-assertion.mjs so validatedAtMilestone is always populated
 5. CRITIC: Opus-tier critic evaluates all assertions. Exit only on "all validation criteria have been met"
 6. FIX: Spawn fix workers for failures, re-validate (max 5 iterations)
-7. COMPLETE: Update state, write summary
+7. COMPLETE: Flip features to completed, update state.json, re-run Phase 0 as exit gate
 
 ## Mission Directory Schema
 
@@ -57,16 +58,21 @@ Required files in `.factory/missions/<id>/`:
 8. features.json stays pending unless explicitly written back -- sync-features-state after every batch
 9. External work must be reconciled before dispatch -- reconcile-external-work in Phase 1.5
 10. Zombie `workerSessionIds` appear alive in features.json -- detect-zombies cross-checks progress_log
+11. Schema drift bites late -- Phase 0 validates against Factory's harness contract before any write; Phase 7 re-runs it as the exit gate
+12. Validation writes must go through record-assertion.mjs so `validatedAtMilestone` is populated from feature.fulfills; hand-written entries fail the harness check
 
-## Scripts (8 total)
+## Scripts (11 total)
 
 | Script | Purpose |
 |--------|---------|
 | parse-mission.mjs | Parse + validate mission directory |
+| validate-schema.mjs | JS port of Factory's mission_contracts.py; schema + cross-reference checks |
+| validate-mission.mjs | Combined validator: runs validate-schema.mjs AND Factory's Python harness when available |
 | decompose-features.mjs | Group features into parallel batches |
 | generate-worker-prompts.mjs | Build complete worker prompts from feature specs |
 | run-assertion.mjs | Generate assertion validation commands |
+| record-assertion.mjs | Write validation-state.json entries with `validatedAtMilestone` populated |
 | critic-evaluator.mjs | Evaluate pass/fail verdict from validation-state |
-| sync-features-state.mjs | **[NEW]** Write back features.json status from git HEAD after batches |
-| detect-zombies.mjs | **[NEW]** Classify features as dead-work-landed, dead-no-session, pending-but-landed, or healthy |
-| reconcile-external-work.mjs | **[NEW]** Score each feature's completion evidence, route to skip/verify/execute |
+| sync-features-state.mjs | Write back features.json status from git HEAD after batches (no non-schema keys) |
+| detect-zombies.mjs | Classify features as dead-work-landed, dead-no-session, pending-but-landed, or healthy |
+| reconcile-external-work.mjs | Score each feature's completion evidence, route to skip/verify/execute |

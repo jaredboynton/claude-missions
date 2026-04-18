@@ -138,7 +138,9 @@ function reconcileExternalWork(missionPath, { apply = false } = {}) {
     if (score >= 50) {
       decision = "mark-completed";
       feature.status = "completed";
-      feature.reconciledFrom = "external-work";
+      // Do not add non-schema keys here. Reconciliation provenance is returned
+      // in the script output; if persistence is needed later, extend the
+      // schema upstream first.
     } else if (score >= 20) {
       decision = "likely-done-verify-first";
     } else if (score >= 10) {

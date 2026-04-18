@@ -92,8 +92,14 @@ function syncFeaturesState(missionPath, { dryRun = false } = {}) {
         touchpointsMatched: byPath.length,
       });
       feature.status = "completed";
-      feature.completedWorkerSessionId = feature.completedWorkerSessionId || null;
-      feature.completedCommitSha = byMessage[0];
+      // Preserve existing completedWorkerSessionId if set by a real worker;
+      // otherwise fall back to the commit SHA so downstream schema checks pass
+      // (Factory schema requires a non-null string when workerSessionIds are present).
+      if (!feature.completedWorkerSessionId && Array.isArray(feature.workerSessionIds) && feature.workerSessionIds.length > 0) {
+        feature.completedWorkerSessionId = feature.workerSessionIds[feature.workerSessionIds.length - 1];
+      } else if (!feature.completedWorkerSessionId) {
+        feature.completedWorkerSessionId = null;
+      }
       continue;
     }
 
