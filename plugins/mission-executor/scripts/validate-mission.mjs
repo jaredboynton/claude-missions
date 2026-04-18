@@ -17,6 +17,8 @@ import { resolve, join, dirname } from "node:path";
 import { execSync } from "node:child_process";
 
 import { validateMissionSchema } from "./validate-schema.mjs";
+import { fileURLToPath as _fileURLToPath } from "node:url";
+import { realpathSync as _realpathSync } from "node:fs";
 
 function findFactoryHarness(missionPath) {
   // Walk up from the mission dir looking for .factory/scripts/harness/ or scripts/harness/.
@@ -101,7 +103,7 @@ function validateMission(missionPath, options = {}) {
   };
 }
 
-const isMain = import.meta.url === `file://${process.argv[1]}`;
+const isMain = (() => { try { return !!process.argv[1] && _fileURLToPath(import.meta.url) === _realpathSync(process.argv[1]); } catch { return false; } })();
 if (isMain && process.argv[2]) {
   const strict = process.argv.includes("--strict");
   const jsonOut = process.argv.includes("--json");

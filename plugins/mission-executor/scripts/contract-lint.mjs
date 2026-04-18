@@ -26,6 +26,8 @@ import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
 import { join, resolve, relative, dirname } from "node:path";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { fileURLToPath as _fileURLToPath } from "node:url";
+import { realpathSync as _realpathSync } from "node:fs";
 
 const SUSPECT_PHRASES = [
   /\bbypass(es|ed|ing)?\b/i,
@@ -275,7 +277,7 @@ function lintContract(missionPath) {
   };
 }
 
-const isMain = import.meta.url === `file://${process.argv[1]}`;
+const isMain = (() => { try { return !!process.argv[1] && _fileURLToPath(import.meta.url) === _realpathSync(process.argv[1]); } catch { return false; } })();
 if (isMain && process.argv[2]) {
   const result = lintContract(process.argv[2]);
   process.stdout.write(JSON.stringify(result, null, 2) + "\n");

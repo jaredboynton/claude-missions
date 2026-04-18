@@ -5,6 +5,8 @@
 
 import { readFileSync } from "node:fs";
 import { resolve, join } from "node:path";
+import { fileURLToPath as _fileURLToPath } from "node:url";
+import { realpathSync as _realpathSync } from "node:fs";
 
 function decomposeFeatures(features, maxWorkers = 5) {
   const milestones = [...new Set(features.map((f) => f.milestone))];
@@ -49,7 +51,7 @@ function classifyWorkerType(skillName) {
   return mapping[skillName] || { focus: "General", conventions: "Follow existing patterns." };
 }
 
-const isMain = import.meta.url === `file://${process.argv[1]}`;
+const isMain = (() => { try { return !!process.argv[1] && _fileURLToPath(import.meta.url) === _realpathSync(process.argv[1]); } catch { return false; } })();
 if (isMain && process.argv[2]) {
   const missionPath = resolve(process.argv[2]);
   const maxWorkers = parseInt(process.argv.find((a) => a.startsWith("--max-workers="))?.split("=")[1] || "5");

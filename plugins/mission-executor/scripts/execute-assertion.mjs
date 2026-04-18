@@ -32,6 +32,8 @@ import { join, resolve, dirname } from "node:path";
 import { execSync, spawnSync } from "node:child_process";
 
 import { recordAssertion } from "./record-assertion.mjs";
+import { fileURLToPath as _fileURLToPath } from "node:url";
+import { realpathSync as _realpathSync } from "node:fs";
 
 const DEFAULT_HTTP = "http://127.0.0.1:4096";
 
@@ -372,7 +374,7 @@ function executeAssertion(missionPath, opts = {}) {
   };
 }
 
-const isMain = import.meta.url === `file://${process.argv[1]}`;
+const isMain = (() => { try { return !!process.argv[1] && _fileURLToPath(import.meta.url) === _realpathSync(process.argv[1]); } catch { return false; } })();
 if (isMain && process.argv[2]) {
   const missionPath = process.argv[2];
   const args = Object.fromEntries(

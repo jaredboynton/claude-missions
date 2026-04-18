@@ -22,6 +22,8 @@ import { readFileSync, existsSync, statSync } from "node:fs";
 import { join, resolve, isAbsolute } from "node:path";
 import { execSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { fileURLToPath as _fileURLToPath } from "node:url";
+import { realpathSync as _realpathSync } from "node:fs";
 
 function sha256File(path) {
   if (!existsSync(path)) return null;
@@ -240,7 +242,7 @@ function evaluateMission(missionPath, opts = {}) {
   };
 }
 
-const isMain = import.meta.url === `file://${process.argv[1]}`;
+const isMain = (() => { try { return !!process.argv[1] && _fileURLToPath(import.meta.url) === _realpathSync(process.argv[1]); } catch { return false; } })();
 if (isMain && process.argv[2]) {
   const opts = {};
   for (const a of process.argv.slice(3)) {

@@ -19,6 +19,8 @@
 
 import { readFileSync, existsSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
+import { fileURLToPath as _fileURLToPath } from "node:url";
+import { realpathSync as _realpathSync } from "node:fs";
 
 const ALLOWED_MISSION_STATES = new Set(["completed", "orchestrator_turn", "paused", "running"]);
 const ALLOWED_FEATURE_STATUSES = new Set(["cancelled", "completed", "in_progress", "pending"]);
@@ -449,7 +451,7 @@ function validateMissionSchema(missionPath) {
   };
 }
 
-const isMain = import.meta.url === `file://${process.argv[1]}`;
+const isMain = (() => { try { return !!process.argv[1] && _fileURLToPath(import.meta.url) === _realpathSync(process.argv[1]); } catch { return false; } })();
 if (isMain && process.argv[2]) {
   const strict = process.argv.includes("--strict");
   const result = validateMissionSchema(process.argv[2]);

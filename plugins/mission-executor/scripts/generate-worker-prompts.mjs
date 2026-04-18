@@ -5,6 +5,8 @@
 
 import { readFileSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { fileURLToPath as _fileURLToPath } from "node:url";
+import { realpathSync as _realpathSync } from "node:fs";
 
 function generateWorkerPrompt({ feature, workerName, teamName, boundaries, buildCommand, conventions, workingDirectory }) {
   const workerType = classifySkill(feature.skillName);

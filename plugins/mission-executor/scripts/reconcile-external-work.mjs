@@ -18,6 +18,8 @@ import { join, resolve } from "node:path";
 import { execSync } from "node:child_process";
 import { syncFeaturesState } from "./sync-features-state.mjs";
 import { detectZombies } from "./detect-zombies.mjs";
+import { fileURLToPath as _fileURLToPath } from "node:url";
+import { realpathSync as _realpathSync } from "node:fs";
 
 function run(cmd, cwd) {
   try {
@@ -240,7 +242,7 @@ function reconcileExternalWork(missionPath, { apply = false } = {}) {
   };
 }
 
-const isMain = import.meta.url === `file://${process.argv[1]}`;
+const isMain = (() => { try { return !!process.argv[1] && _fileURLToPath(import.meta.url) === _realpathSync(process.argv[1]); } catch { return false; } })();
 if (isMain && process.argv[2]) {
   const missionPath = process.argv[2];
   const apply = process.argv.includes("--apply");

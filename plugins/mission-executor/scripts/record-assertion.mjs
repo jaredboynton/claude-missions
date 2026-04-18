@@ -29,6 +29,8 @@
 import { readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
 import { join, resolve, isAbsolute } from "node:path";
 import { createHash } from "node:crypto";
+import { fileURLToPath as _fileURLToPath } from "node:url";
+import { realpathSync as _realpathSync } from "node:fs";
 
 const REQUIRED_PROOF_FIELDS_ON_PASS = [
   "commit-sha",
@@ -174,7 +176,7 @@ function recordAssertion(missionPath, args) {
   };
 }
 
-const isMain = import.meta.url === `file://${process.argv[1]}`;
+const isMain = (() => { try { return !!process.argv[1] && _fileURLToPath(import.meta.url) === _realpathSync(process.argv[1]); } catch { return false; } })();
 if (isMain && process.argv[2]) {
   const missionPath = process.argv[2];
   const args = Object.fromEntries(

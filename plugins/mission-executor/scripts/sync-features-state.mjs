@@ -10,6 +10,8 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { execSync } from "node:child_process";
+import { fileURLToPath as _fileURLToPath } from "node:url";
+import { realpathSync as _realpathSync } from "node:fs";
 
 function run(cmd, cwd) {
   try {
@@ -135,7 +137,7 @@ function syncFeaturesState(missionPath, { dryRun = false } = {}) {
   return summary;
 }
 
-const isMain = import.meta.url === `file://${process.argv[1]}`;
+const isMain = (() => { try { return !!process.argv[1] && _fileURLToPath(import.meta.url) === _realpathSync(process.argv[1]); } catch { return false; } })();
 if (isMain && process.argv[2]) {
   const missionPath = process.argv[2];
   const dryRun = process.argv.includes("--dry-run");

@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { fileURLToPath as _fileURLToPath } from "node:url";
+import { realpathSync as _realpathSync } from "node:fs";
 // Execute a single validation assertion and return pass/fail with evidence.
 // Usage: node run-assertion.mjs --id=VAL-XXX-NNN --tool=curl --evidence="..." --working-dir=/path
 //
@@ -109,7 +111,7 @@ function generateTuistoryFlow(id, evidence, workingDir, options = {}) {
   ];
 }
 
-const isMain = import.meta.url === `file://${process.argv[1]}`;
+const isMain = (() => { try { return !!process.argv[1] && _fileURLToPath(import.meta.url) === _realpathSync(process.argv[1]); } catch { return false; } })();
 if (isMain && process.argv[2]) {
   const args = Object.fromEntries(
     process.argv.slice(2).filter((a) => a.startsWith("--")).map((a) => {
