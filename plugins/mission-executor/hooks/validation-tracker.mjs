@@ -1,17 +1,21 @@
 #!/usr/bin/env node
-// PostToolUse hook: When in validation phase, detect assertion evidence
-// in tool outputs and auto-update validation-state.json.
+// PostToolUse hook: worker-claim audit log (AUDIT ONLY, never authoritative).
 //
-// Looks for patterns like "VAL-XXX-NNN: PASS" or "VAL-XXX-NNN: FAIL"
-// in tool results and updates the mission's validation-state.json.
+// Prior versions of this hook pattern-scraped tool output for "VAL-XXX: PASS"
+// strings and wrote them directly to validation-state.json. That let any
+// worker flip an assertion to passed just by echoing the right string.
+//
+// The hook now appends to .omc/validation/worker-claims.jsonl for forensic
+// audit. It NEVER writes to validation-state.json. Only execute-assertion.mjs
+// (gated by MISSION_EXECUTOR_WRITER=1 and assertion-proof-guard hook) can
+// move a status to passed.
 
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, appendFileSync, mkdirSync, existsSync } from "node:fs";
+import { join, dirname } from "node:path";
 
 const MISSION_STATE_PATH = ".omc/state/mission-executor-state.json";
-const VAL_PATTERN = /\bVAL-[A-Z]+-\d+[a-z]?\b/g;
-const PASS_PATTERN = /\b(VAL-[A-Z]+-\d+[a-z]?)\s*[:|]\s*(PASS|passed|pass)\b/gi;
-const FAIL_PATTERN = /\b(VAL-[A-Z]+-\d+[a-z]?)\s*[:|]\s*(FAIL|failed|fail)\b/gi;
+const CLAIMS_LOG = ".omc/validation/worker-claims.jsonl";
+const VAL_PATTERN = /\b(VAL-[A-Z]+-\d+[a-z]?)\s*[:|]\s*(PASS|passed|pass|FAIL|failed|fail)\b/gi;
 
 function loadMissionState(cwd) {
   const statePath = join(cwd, MISSION_STATE_PATH);
@@ -23,64 +27,65 @@ function loadMissionState(cwd) {
   }
 }
 
-function updateValidationState(missionPath, updates) {
-  const valPath = join(missionPath, "validation-state.json");
-  if (!existsSync(valPath)) return;
-
-  try {
-    const valState = JSON.parse(readFileSync(valPath, "utf8"));
-    let changed = false;
-
-    for (const [id, status] of Object.entries(updates)) {
-      if (valState.assertions?.[id]) {
-        valState.assertions[id].status = status;
-        changed = true;
-      }
-    }
-
-    if (changed) {
-      writeFileSync(valPath, JSON.stringify(valState, null, 2) + "\n");
-    }
-  } catch {
-    // Silently ignore write failures
-  }
+function appendClaim(missionPath, entry) {
+  const logPath = join(missionPath, CLAIMS_LOG);
+  mkdirSync(dirname(logPath), { recursive: true });
+  appendFileSync(logPath, JSON.stringify(entry) + "\n");
 }
 
 async function main() {
   let input = "";
   for await (const chunk of process.stdin) input += chunk;
 
-  const parsed = JSON.parse(input);
-  // Claude Code PostToolUse uses `tool_response`; older docs said `tool_result`.
-  // Accept either for forward/backward compatibility.
-  const tool_result = parsed.tool_response ?? parsed.tool_result;
-  const cwd = process.env.CLAUDE_WORKING_DIR || process.cwd();
-  const state = loadMissionState(cwd);
-
-  if (!state || !state.active || !state.missionPath || state.phase !== "verify") {
+  let parsed;
+  try {
+    parsed = JSON.parse(input);
+  } catch {
     process.stdout.write(JSON.stringify({}));
     return;
   }
 
-  const output = typeof tool_result === "string" ? tool_result : JSON.stringify(tool_result);
-  const updates = {};
+  const tool_result = parsed.tool_response ?? parsed.tool_result;
+  const tool_name = parsed.tool_name;
+  const session_id = parsed.session_id || "unknown";
+  const cwd = process.env.CLAUDE_WORKING_DIR || process.cwd();
+  const state = loadMissionState(cwd);
 
-  for (const match of output.matchAll(PASS_PATTERN)) {
-    updates[match[1].toUpperCase()] = "passed";
-  }
-
-  for (const match of output.matchAll(FAIL_PATTERN)) {
-    updates[match[1].toUpperCase()] = "failed";
-  }
-
-  if (Object.keys(updates).length > 0) {
-    updateValidationState(state.missionPath, updates);
-    process.stdout.write(JSON.stringify({
-      message: `[Validation Tracker] Updated ${Object.keys(updates).length} assertion(s): ${Object.entries(updates).map(([id, s]) => `${id}=${s}`).join(", ")}`
-    }));
-  } else {
+  if (!state || !state.active || !state.missionPath) {
     process.stdout.write(JSON.stringify({}));
+    return;
   }
+
+  const output = typeof tool_result === "string" ? tool_result : JSON.stringify(tool_result ?? "");
+  const claims = [];
+
+  for (const match of output.matchAll(VAL_PATTERN)) {
+    const assertionId = match[1].toUpperCase();
+    const claim = /pass/i.test(match[2]) ? "pass" : "fail";
+    const rawStart = Math.max(0, match.index - 40);
+    const rawEnd = Math.min(output.length, match.index + match[0].length + 40);
+    claims.push({
+      assertionId,
+      claim,
+      sessionId: session_id,
+      timestamp: new Date().toISOString(),
+      toolName: tool_name,
+      rawExcerpt: output.slice(rawStart, rawEnd),
+    });
+  }
+
+  if (claims.length === 0) {
+    process.stdout.write(JSON.stringify({}));
+    return;
+  }
+
+  for (const claim of claims) appendClaim(state.missionPath, claim);
+
+  // Audit-only: never flips status. Return advisory message to the agent so
+  // they know their claim was logged but is NOT authoritative.
+  process.stdout.write(JSON.stringify({
+    message: `[worker-claims] Logged ${claims.length} assertion claim(s) to ${CLAIMS_LOG}. These are AUDIT-ONLY. Only execute-assertion.mjs can move status to passed.`,
+  }));
 }
 
 main().catch((e) => {

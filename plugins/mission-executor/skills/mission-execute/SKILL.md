@@ -51,6 +51,32 @@ The combined validator runs:
 
 **Never proceed past Phase 0 with schema errors.** Fix manually, then re-run.
 
+### Phase 0.5: CONTRACT-LINT (new)
+
+Walk nested `AGENTS.md` files in the working directory and flag
+assertions that contradict the project's own architectural docs. This
+catches the VAL-CLI-003 pattern from bee21e7c where a contract asserted
+behavior (`--require-gate` must invoke the orchestrator gate) that
+`packages/kep/src/cli/cmd/AGENTS.md` explicitly says is bypassed by
+design.
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/contract-lint.mjs" "$MISSION_PATH"
+```
+
+Signals searched for in AGENTS.md paragraphs that mention an assertion's
+keywords: `bypasses`, `by design`, `deliberately`, `intentionally`,
+`trusted`, `deprecated`, `no longer`, `MUST NOT`, `NEVER`.
+
+Contradictions hard-halt. The user either:
+
+- Edits the assertion in validation-contract.md, OR
+- Adds `contradiction-acknowledged: <sha-prefix-of-AGENTS.md>` inside
+  the assertion body (only valid while the referenced AGENTS.md matches
+  that sha).
+
+Exit 0 proceeds; exit 1 halts.
+
 ### Phase 1: INGEST
 
 Read and parse the mission directory:
@@ -182,44 +208,109 @@ This scans git log for commits mentioning feature IDs and flips status from
 this step, features.json remains stale ("runner saw no worker completions")
 even though the code shipped.
 
-### Phase 4: VERIFY
+### Phase 4a: INVALIDATE STALE EVIDENCE
 
-For each assertion in validation-contract.md:
+Before running any new assertion, sweep prior proofs that are no longer
+fresh. A passed assertion whose `proof.commitSha` is not an ancestor of
+HEAD (or whose touchpoints changed since the proof was captured) is
+flipped to `stale` and its proof bundle is archived.
 
-1. Parse the assertion's tool type
-2. Execute the appropriate verification:
-   - `unit-test`: Run the test file, check green
-   - `curl`: Execute the HTTP request, check response shape
-   - `cli-binary`: Run the CLI command, check exit code + output
-   - `tuistory`: Launch TUI via tuistory, navigate, capture snapshot, check content
-3. Record result via the helper (never hand-write validation-state.json):
-   ```bash
-   node "${CLAUDE_PLUGIN_ROOT}/scripts/record-assertion.mjs" "$MISSION_PATH" \
-     --id=VAL-XXX-NNN --status=passed --evidence="..."
-   ```
-   The helper sets `validatedAtMilestone` automatically from the feature's
-   `fulfills` mapping. Hand-writing skips this field and fails Factory's
-   harness check.
-4. Write detailed evidence to `.omc/validation/{assertion-id}.md`
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/invalidate-stale-evidence.mjs" "$MISSION_PATH"
+```
 
-**Verification workers**: Spawn up to 3 parallel validators:
-- HTTP validator: all curl + cli-binary assertions
-- TUI validator: all tuistory assertions (max 1 session at a time)
-- Unit test validator: all unit-test assertions (run test suite)
+This is the first line of defense against the bee21e7c failure mode: the
+prior wave had 95 passed assertions with evidence strings reading
+`"critic-confirmed in prior session"`. No command had been run this run.
+The invalidator demotes every such entry to `stale` so Phase 4b re-runs
+them from scratch.
 
-### Phase 5: CRITIC
+### Phase 4b: VERIFY (driven by execute-assertion.mjs)
 
-Spawn a critic agent (oh-my-claudecode:critic) that:
+For every assertion in validation-state.json that is `pending` or `stale`,
+run `execute-assertion.mjs`. This is the ONLY path that writes
+`passed` into validation-state.json.
 
-1. Reads validation-state.json -- counts PASS / FAIL / PENDING
-2. Reads all evidence files in .omc/validation/
-3. Cross-references against validation-contract.md
-4. Produces a verdict:
-   - If ALL assertions pass: output exactly "all validation criteria have been met"
-   - If any FAIL: list each failure with assertion ID, evidence, and root cause analysis
-   - If any PENDING: list each with strategy to reach the required state
+```bash
+# Plugin sets MISSION_EXECUTOR_WRITER=1 so the proof-guard hook allows the
+# validation-state.json write that record-assertion.mjs performs internally.
+for id in $(jq -r '.assertions | to_entries[] | select(.value.status=="pending" or .value.status=="stale") | .key' \
+  "$MISSION_PATH/validation-state.json"); do
+  MISSION_EXECUTOR_WRITER=1 \
+    node "${CLAUDE_PLUGIN_ROOT}/scripts/execute-assertion.mjs" "$MISSION_PATH" --id="$id"
+done
+```
 
-**Exit condition**: Critic must output the exact string "all validation criteria have been met" to proceed to Phase 7. Otherwise, proceed to Phase 6.
+Tool-type dispatch (internal to execute-assertion.mjs):
+
+| tool | action | pass condition |
+|---|---|---|
+| `unit-test` | `bun test <file> -t <name>` | exit 0 and test name in stdout |
+| `curl` | emit command from evidence, run with `-w "\nHTTP_STATUS:%{http_code}"`, compare status and required fields | status match + all required fields present |
+| `cli-binary` | resolve `MISSION_CLI_BIN`, run extracted backtick command | exit code matches + required literal present |
+| `tuistory` | launch tuistory session, snapshot, grep | snapshot contains required literal |
+| `literal-probe` | `rg --fixed-strings` declared literal against repo | ≥1 match |
+
+Each execution writes a proof bundle to
+`.omc/validation/proofs/<id>/{stdout.txt,stderr.txt,meta.json}` and
+records:
+
+```json
+{
+  "status": "passed",
+  "proof": {
+    "commitSha": "<HEAD at execution>",
+    "toolType": "curl",
+    "command": "curl -sS ...",
+    "exitCode": 0,
+    "stdoutSha256": "...",
+    "stderrSha256": "...",
+    "stdoutPath": ".omc/validation/proofs/VAL-X/stdout.txt",
+    "stderrPath": ".omc/validation/proofs/VAL-X/stderr.txt",
+    "touchpoints": ["packages/kep/src/..."],
+    "executedAt": "2026-04-18T...",
+    "executor": "execute-assertion.mjs"
+  }
+}
+```
+
+record-assertion.mjs REJECTS `passed` without these fields.
+
+Exit codes: 0 passed, 1 failed, 2 blocked (evidence unparseable or env
+incomplete), 3 infrastructure (daemon down, binary missing).
+
+**Never hand-write validation-state.json.** The
+`assertion-proof-guard.mjs` hook (PreToolUse Write|Edit) blocks direct
+edits to that file at the tool level.
+
+### Phase 4c: INVALIDATE AGAIN
+
+Re-run `invalidate-stale-evidence.mjs` after VERIFY. Protects against
+late commits that would make a freshly-recorded proof stale by the time
+the critic runs.
+
+### Phase 5a: CRITIC — STAGE A (structural)
+
+Run `critic-evaluator.mjs`. Stage A verifies for every `passed`
+assertion:
+
+- `proof` block present with all required fields
+- `proof.commitSha` is an ancestor of HEAD
+- recomputed sha256 of `stdoutPath`/`stderrPath` matches proof
+
+Any failure here means a proof was tampered with or never produced. The
+critic returns verdict `INCOMPLETE` / `FAIL` and does NOT proceed to Stage B.
+
+### Phase 5b: CRITIC — STAGE B (spot re-execute)
+
+If Stage A is clean, the critic samples 20% of passed assertions + 100%
+of literal-probe assertions and re-runs them via execute-assertion.mjs.
+Any divergence (a previously-passed assertion now failing) is a
+regression.
+
+Only a clean Stage A + clean Stage B emits the exact string
+`"all validation criteria have been met"`, which is the only sentinel
+the pipeline accepts to advance to Phase 7.
 
 ### Phase 6: FIX
 
@@ -275,6 +366,16 @@ These failure modes were discovered during live mission execution and are built 
 7. **Command palette navigation is context-dependent**: TUI panel commands only appear in the palette when registered from the correct view context. Validation must navigate to the right view first.
 
 8. **Error response contracts drift**: HTTP error responses may lack required fields (like structured error codes) even when the handler exists. Validation must check response shapes precisely.
+
+9. **Status is cheap, proof is not (bee21e7c lesson)**: A prior plugin wave seeded validation-state.json's 95 `passed` entries from natural-language strings in .omc/validation/*.md left over from an earlier run. No command had been executed that wave. Lesson: the ONLY path to `passed` is `execute-assertion.mjs`, which writes a `proof` object with commitSha + sha256'd stdout/stderr. `record-assertion.mjs` rejects passed writes that lack proof.
+
+10. **Commit titles are narrative, not behavioral**: The old reconcile scorer awarded +50 points for a commit message mentioning a feature id. That auto-marked `nav-missing-mission-scoping-route` completed while `mission-scoping.tsx:77-82` was still a literal `// TODO`. Lesson: commit messages score 0. `mark-completed` requires proofs on linked assertions.
+
+11. **Hook scraping is a spoof surface**: The old `validation-tracker.mjs` scraped tool output for `"VAL-XXX: PASS"` strings and wrote them to validation-state.json. Any worker could echo the string in Bash and flip the assertion. Lesson: hooks never write authoritative state; they append to `worker-claims.jsonl` as audit-only, and `assertion-proof-guard.mjs` blocks tool-level edits to validation-state.json.
+
+12. **Stale evidence must be invalidated, never trusted**: Evidence files from prior waves are input-only audit artefacts. If a prior proof's commitSha is no longer an ancestor of HEAD, or touchpoints moved since it was captured, the proof is `stale` and the assertion must be re-executed. `invalidate-stale-evidence.mjs` runs at both the start of Phase 4 and before the critic.
+
+13. **Contract contradictions AGENTS.md contradictions must surface at Phase 0.5**: VAL-CLI-003 contradicted `packages/kep/src/cli/cmd/AGENTS.md`'s documented trust model. Lesson: `contract-lint.mjs` walks every nested AGENTS.md before workers spawn; unacknowledged contradictions hard-halt.
 
 ## Configuration
 

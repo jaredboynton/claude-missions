@@ -82,24 +82,25 @@ function syncFeaturesState(missionPath, { dryRun = false } = {}) {
     const { byMessage, byPath, touchpoints } = findCommitsForFeature(feature, workingDir);
     const allCommits = [...new Set([...byMessage, ...byPath])];
 
+    // A commit message mentioning a feature id is NOT sufficient to mark the
+    // feature completed. The bee21e7c run marked `nav-missing-mission-scoping-route`
+    // completed on commit-title evidence while `mission-scoping.tsx:77-82` was
+    // still a literal `// TODO`. Evidence must come from assertion proof, which
+    // reconcile-external-work.mjs handles by reading validation-state.json.
+    //
+    // This script now only emits a `likely_completed` hint (audit-only)
+    // when commit titles or touchpoints suggest work landed. Status flip to
+    // completed is reserved for the reconciler when proofs support it.
     if (byMessage.length > 0) {
       transitions.push({
         featureId: feature.id,
         from: feature.status,
-        to: "completed",
+        to: "likely_completed",
         evidence: `commit message mentions feature ID: ${byMessage.join(", ")}`,
         commitSha: byMessage[0],
         touchpointsMatched: byPath.length,
+        note: "audit-only hint; sync-features-state no longer auto-completes on commit titles",
       });
-      feature.status = "completed";
-      // Preserve existing completedWorkerSessionId if set by a real worker;
-      // otherwise fall back to the commit SHA so downstream schema checks pass
-      // (Factory schema requires a non-null string when workerSessionIds are present).
-      if (!feature.completedWorkerSessionId && Array.isArray(feature.workerSessionIds) && feature.workerSessionIds.length > 0) {
-        feature.completedWorkerSessionId = feature.workerSessionIds[feature.workerSessionIds.length - 1];
-      } else if (!feature.completedWorkerSessionId) {
-        feature.completedWorkerSessionId = null;
-      }
       continue;
     }
 

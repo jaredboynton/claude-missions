@@ -22,7 +22,10 @@ import { join, resolve, dirname } from "node:path";
 
 const ALLOWED_MISSION_STATES = new Set(["completed", "orchestrator_turn", "paused", "running"]);
 const ALLOWED_FEATURE_STATUSES = new Set(["cancelled", "completed", "in_progress", "pending"]);
-const ALLOWED_ASSERTION_STATUSES = new Set(["failed", "passed", "pending"]);
+// "stale" is an internal status used by invalidate-stale-evidence.mjs when a
+// proof's commitSha drifts past HEAD. Treat it as pending for Factory harness
+// compatibility but accept it as a valid value here.
+const ALLOWED_ASSERTION_STATUSES = new Set(["failed", "passed", "pending", "stale"]);
 
 const STATE_REQUIRED_KEYS = [
   "missionId",
@@ -282,6 +285,7 @@ function validateValidationState(missionName, payload) {
     assertionNames: new Set(),
     assertionStatuses: {},
     missingValidatedAt: [],
+    missingProof: [],
     validatedAt: [],
   };
 
@@ -312,6 +316,12 @@ function validateValidationState(missionName, payload) {
     }
     if (status === "passed" && !validatedAt) {
       metrics.missingValidatedAt.push([missionName, assertionId]);
+    }
+    // A passed assertion without a `proof` block is the bee21e7c failure
+    // mode: status seeded from prior-session text instead of a live execute.
+    // Warn here so operators notice even if they bypass the critic.
+    if (status === "passed" && (!assertion.proof || !assertion.proof.commitSha)) {
+      metrics.missingProof.push([missionName, assertionId]);
     }
     if (typeof validatedAt === "string") {
       metrics.validatedAt.push([assertionId, validatedAt]);
@@ -372,7 +382,7 @@ function validateMissionSchema(missionPath) {
     featureMetrics = r.metrics;
   }
 
-  let assertionMetrics = { assertionNames: new Set(), assertionStatuses: {}, missingValidatedAt: [], validatedAt: [] };
+  let assertionMetrics = { assertionNames: new Set(), assertionStatuses: {}, missingValidatedAt: [], missingProof: [], validatedAt: [] };
   if (validationState) {
     const r = validateValidationState(missionName, validationState);
     errors.push(...r.errors);
@@ -410,6 +420,7 @@ function validateMissionSchema(missionPath) {
   }
 
   warnings.push(...summarize("passed assertions are missing validatedAtMilestone", assertionMetrics.missingValidatedAt));
+  warnings.push(...summarize("passed assertions are missing a `proof` block (not execute-assertion.mjs output)", assertionMetrics.missingProof, "these passes are not trusted by the two-stage critic"));
   warnings.push(...summarize("assertions reference milestones not present in mission features", unknownMilestones));
   warnings.push(...summarize("completed features with workerSessionIds lack a non-null completedWorkerSessionId", featureMetrics.missingCompletedRefs));
   warnings.push(...summarize("assertions are not fulfilled by any feature", orphanEntries));
