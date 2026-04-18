@@ -1,0 +1,18 @@
+{
+  "name": "claude-missions",
+  "version": "0.1.0",
+  "owner": { "name": "Jared Boynton", "url": "https://github.com/jaredboynton" },
+  "metadata": {
+    "description": "Plugins for orchestrating Factory/droid mission execution in Claude Code: parallel teams, independent validation, critic-gated completion."
+  },
+  "plugins": [
+    {
+      "name": "mission-executor",
+      "description": "Full autopilot execution of Factory/droid missions: parallel teams, critic-gated completion, zombie detection, external-work reconciliation, and features.json state write-back.",
+      "source": "./plugins/mission-executor",
+      "homepage": "https://github.com/jaredboynton/claude-missions",
+      "category": "automation",
+      "tags": ["factory", "droid", "mission", "teams", "autopilot"]
+    }
+  ]
+}
