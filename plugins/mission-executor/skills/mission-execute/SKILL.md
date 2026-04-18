@@ -13,9 +13,41 @@ triggers:
 
 Fully automated execution of Factory/droid missions. Reads the mission spec, decomposes features into parallel teams, executes, validates every assertion, fixes failures, and loops until a critic confirms 100% pass rate.
 
+**AUTOPILOT — the assistant is locked into this pipeline until completion.** The `autopilot-lock.mjs` Stop hook blocks the assistant from ending its turn while a mission is active, and `no-ask-during-mission.mjs` blocks `AskUserQuestion`. Summaries, progress reports, and "what would you like next?" prompts are not valid exits. The mission is complete only when:
+
+- every assertion in `validation-state.json` is `status=passed` with a `proof` block carrying `commitSha`,
+- every feature in `features.json` is `status=completed`, and
+- `state.json` has `state=completed`.
+
+Escape hatch: the user may create `<working-dir>/.omc/state/mission-executor-abort` to release the lock mid-run.
+
 ## Input
 
 - `<mission-path>`: Path to `.factory/missions/<id>/` directory. If omitted, auto-discovers paused missions in the working directory's `.factory/missions/`.
+
+## Lifecycle state
+
+Before Phase 0 runs, the skill MUST register mission state so the Stop hook can enforce completion:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/mission-lifecycle.mjs" start "$MISSION_PATH"
+```
+
+This writes `<working-dir>/.omc/state/mission-executor-state.json` with `active=true`. The Stop hook reads that file and refuses to let the assistant end its turn until completion criteria are met.
+
+At each phase transition, update the phase label so operator logs track progress:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/mission-lifecycle.mjs" phase "<phase-id>"
+```
+
+At Phase 7's final step, clear the state:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/mission-lifecycle.mjs" complete
+```
+
+The hooks will then allow the turn to end normally.
 
 ## Prerequisites
 
@@ -27,8 +59,15 @@ Fully automated execution of Factory/droid missions. Reads the mission spec, dec
 
 ### Phase 0: VALIDATE (hard gate)
 
-Before doing anything else, run schema + cross-reference validation against the
-mission directory. This catches malformed `features.json` / `validation-state.json`
+Very first action in the pipeline -- register mission state so the
+autopilot Stop hook activates:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/mission-lifecycle.mjs" start "$MISSION_PATH"
+```
+
+Then run schema + cross-reference validation against the mission
+directory. This catches malformed `features.json` / `validation-state.json`
 / `state.json` before any downstream script corrupts them further.
 
 ```bash
@@ -339,7 +378,13 @@ For each FAIL from the critic:
    ```bash
    node "${CLAUDE_PLUGIN_ROOT}/scripts/validate-mission.mjs" "$MISSION_PATH"
    ```
-8. Report final status to user
+8. **Clear mission state to release the autopilot lock**:
+   ```bash
+   node "${CLAUDE_PLUGIN_ROOT}/scripts/mission-lifecycle.mjs" complete
+   ```
+   Without this, `autopilot-lock.mjs` will keep blocking Stop even when
+   criteria are met.
+9. Report final status to user
 
 ## Lessons Encoded (from real execution)
 
@@ -386,6 +431,10 @@ These failure modes were discovered during live mission execution and are built 
 15. **Alignment check suppresses affirm-not-contradict**: when an assertion body mentions any suspect-phrase root (`bypass`, `deliberat`, `trusted`, `by design`, `in-process`, `trust model`), the assertion is describing the same behavior the AGENTS.md documents. Not a contradiction. Example: VAL-CLI-001 asserts `--help stdout contains the substring "bypasses"` — the assertion is affirming the documented bypass, not demanding enforcement. A real contradiction looks like VAL-CLI-003: assertion demands enforcement behavior (non-zero exit, `MissionOrchestratorOnlyError`) WITHOUT referencing the documented trust model.
 
 16. **Worker prompts must forbid contract-edit shortcuts**: a common failure mode in fix-loop iterations is the worker seeing a failing assertion, judging the code correct, and editing the contract to match. This silently launders bugs into the passed column. The worker preamble now explicitly forbids editing `validation-contract.md` and `validation-state.json`; the `assertion-proof-guard.mjs` hook blocks the latter at the tool level.
+
+17. **"Full autopilot" requires Stop-hook enforcement, not prose**: the skill doc said "fully automated execution" but nothing prevented the assistant from writing a progress summary and handing back mid-pipeline. Real autopilot requires a Stop hook that inspects mission-completion criteria on every turn-end attempt and rejects with a precise blocker list. `autopilot-lock.mjs` blocks Stop whenever `active=true` in `.omc/state/mission-executor-state.json` AND any of: assertions unpassed / features uncompleted / `state.json != completed`. The sibling `no-ask-during-mission.mjs` blocks `AskUserQuestion` so the assistant can't pause for user input either. Escape hatch for humans: create `.omc/state/mission-executor-abort` to release.
+
+18. **Lifecycle scripts, not orchestrator discipline**: the state file is written by `mission-lifecycle.mjs start` at Phase 0 and cleared by `mission-lifecycle.mjs complete` at Phase 7. Orchestrator discipline (remembering to flip a flag) is not reliable under pressure; explicit scripts invoked at the phase boundaries make autopilot non-bypassable.
 
 ## Configuration
 
