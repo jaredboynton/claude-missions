@@ -39,7 +39,7 @@ function findFactoryHarness(missionPath) {
   return null;
 }
 
-function runPythonHarness(harnessRoot) {
+function runPythonHarness(harnessRoot, targetMissionId = null) {
   // harnessRoot is .factory/scripts/. The Python module is scripts.harness.check_missions
   // so we cd to the Factory root (parent of scripts/) and run `python3 -m scripts.harness.check_missions`.
   const factoryRoot = dirname(harnessRoot);
@@ -49,23 +49,43 @@ function runPythonHarness(harnessRoot) {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });
-    return { ok: true, output: out, errors: [], warnings: parseHarnessOutput(out).warnings };
+    const parsed = parseHarnessOutput(out, targetMissionId);
+    return { ok: parsed.errors.length === 0, output: out, errors: parsed.errors, warnings: parsed.warnings };
   } catch (err) {
     const stdout = err.stdout?.toString() || "";
     const stderr = err.stderr?.toString() || "";
     const combined = stdout + stderr;
-    const parsed = parseHarnessOutput(combined);
-    return { ok: false, output: combined, errors: parsed.errors, warnings: parsed.warnings };
+    const parsed = parseHarnessOutput(combined, targetMissionId);
+    return { ok: parsed.errors.length === 0, output: combined, errors: parsed.errors, warnings: parsed.warnings };
   }
 }
 
-function parseHarnessOutput(text) {
+// Factory harness rejects any status not in its allow-list. "stale" is a
+// plugin-internal status (see invalidate-stale-evidence.mjs) that maps to
+// `pending` for harness compatibility. Filter those errors out so we
+// don't double-report them as blockers.
+const STALE_STATUS_ERROR_RE = /invalid status 'stale'/;
+
+function parseHarnessOutput(text, targetMissionId = null) {
+  // When targetMissionId is provided, only report errors/warnings whose
+  // message mentions that mission id. Factory's harness scans every
+  // mission in .factory/missions/ and reports errors globally; we only
+  // care about the one we're executing.
   const errors = [];
   const warnings = [];
+  const mentionsTarget = (msg) => !targetMissionId || msg.includes(targetMissionId);
   for (const line of text.split("\n")) {
     const t = line.trim();
-    if (t.startsWith("ERROR ")) errors.push(t.slice(6));
-    else if (t.startsWith("WARN ")) warnings.push(t.slice(5));
+    if (t.startsWith("ERROR ")) {
+      const msg = t.slice(6);
+      if (STALE_STATUS_ERROR_RE.test(msg)) continue;
+      if (!mentionsTarget(msg)) continue;
+      errors.push(msg);
+    } else if (t.startsWith("WARN ")) {
+      const msg = t.slice(5);
+      if (!mentionsTarget(msg)) continue;
+      warnings.push(msg);
+    }
   }
   return { errors, warnings };
 }
@@ -76,11 +96,15 @@ function validateMission(missionPath, options = {}) {
   // Pass 1: JS schema validation (always runs)
   const js = validateMissionSchema(missionPath);
 
-  // Pass 2: Python harness (if available)
+  // Pass 2: Python harness (if available). Scope to this mission only --
+  // Factory's harness scans every mission in .factory/missions/ and reports
+  // errors globally, but we only want to block on errors for the mission
+  // we're executing.
   const harness = findFactoryHarness(missionPath);
+  const targetMissionId = resolve(missionPath).split("/").pop();
   let py = null;
   if (harness) {
-    py = runPythonHarness(harness.harnessRoot);
+    py = runPythonHarness(harness.harnessRoot, targetMissionId);
   }
 
   const errors = [...js.errors];
