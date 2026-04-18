@@ -377,6 +377,16 @@ These failure modes were discovered during live mission execution and are built 
 
 13. **Contract contradictions AGENTS.md contradictions must surface at Phase 0.5**: VAL-CLI-003 contradicted `packages/kep/src/cli/cmd/AGENTS.md`'s documented trust model. Lesson: `contract-lint.mjs` walks every nested AGENTS.md before workers spawn; unacknowledged contradictions hard-halt.
 
+14. **Contract-lint signal quality matters more than recall**: First run of `contract-lint.mjs` on bee21e7c emitted 15 findings. Only 1 was real. The 14 false positives came from four sources, each now filtered:
+    - **Parser bug**: the assertion-block extractor stopped at the next `###` but not at `##`, so the last assertion in each section absorbed the next section's intro prose and picked up spurious keywords (e.g. VAL-RECOVERY-004 absorbed the `## VAL-CLI` section's "bypass the gate" text).
+    - **External-code mirrors**: `.discovery/` and similar directories contain reference AGENTS.md files (codex-cli, postman-app, etc.) that don't govern kep behavior. Skip these in the AGENTS.md walk alongside `node_modules/`, `dist/`, `.git/`, `.factory/`, `.cache/`.
+    - **Generic English words**: backtick-wrapped tokens like `error`, `code`, `running`, `state`, `status`, `message` match any AGENTS.md phrase too loosely. Maintain a stoplist. Also add the contract's own tool-type tokens (`unit-test`, `curl`, `cli-binary`, `tuistory`, `literal-probe`) because they appear structurally in every assertion and match AGENTS.md paragraphs that use the words in unrelated contexts.
+    - **Cross-paragraph co-occurrence**: if the keyword and the suspect phrase straddle a paragraph break (`\n\n`), they are describing different topics that happen to share a doc. Reject. Example: `server/routes/AGENTS.md` explains HTTP 403 enforcement in one paragraph and the CLI's in-process bypass in the next -- both mention `403` and `bypass` within a ±150 char window but are thematically separate.
+
+15. **Alignment check suppresses affirm-not-contradict**: when an assertion body mentions any suspect-phrase root (`bypass`, `deliberat`, `trusted`, `by design`, `in-process`, `trust model`), the assertion is describing the same behavior the AGENTS.md documents. Not a contradiction. Example: VAL-CLI-001 asserts `--help stdout contains the substring "bypasses"` — the assertion is affirming the documented bypass, not demanding enforcement. A real contradiction looks like VAL-CLI-003: assertion demands enforcement behavior (non-zero exit, `MissionOrchestratorOnlyError`) WITHOUT referencing the documented trust model.
+
+16. **Worker prompts must forbid contract-edit shortcuts**: a common failure mode in fix-loop iterations is the worker seeing a failing assertion, judging the code correct, and editing the contract to match. This silently launders bugs into the passed column. The worker preamble now explicitly forbids editing `validation-contract.md` and `validation-state.json`; the `assertion-proof-guard.mjs` hook blocks the latter at the tool level.
+
 ## Configuration
 
 Environment variables:

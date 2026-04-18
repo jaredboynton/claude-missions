@@ -69,9 +69,17 @@ function parseAssertion(contract, id) {
   const match = contract.match(idPattern);
   if (!match) return null;
   const start = match.index;
-  // Stop at next ### heading or EOF.
+  // Stop at the next `### VAL-` heading OR at any `## ` section heading
+  // that appears first. Without the `## ` stop, a trailing assertion in
+  // one section absorbs the next section's intro text and picks up
+  // spurious keywords / evidence.
   const rest = contract.slice(start + match[0].length);
-  const next = rest.search(/^###\s+/m);
+  const nextH3 = rest.search(/^###\s+/m);
+  const nextH2 = rest.search(/^##\s+/m);
+  let next = -1;
+  if (nextH3 !== -1 && nextH2 !== -1) next = Math.min(nextH3, nextH2);
+  else if (nextH3 !== -1) next = nextH3;
+  else if (nextH2 !== -1) next = nextH2;
   const block = next === -1 ? rest : rest.slice(0, next);
   const fullBlock = contract.slice(start, start + match[0].length + block.length);
 

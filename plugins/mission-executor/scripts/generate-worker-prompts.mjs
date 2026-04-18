@@ -59,6 +59,12 @@ ${buildCommand ? `After EVERY source file change, run: ${buildCommand}` : "Follo
 == ERRORS ==
 If you cannot complete the task, report via SendMessage to "team-lead" with details. Do NOT mark as completed.
 
+== CONTRACT FIDELITY ==
+- The mission's \`validation-contract.md\` is authored against the PROJECT'S documented trust models (nested \`AGENTS.md\` files in the working directory). Your job is to satisfy the contract AS WRITTEN, not to match it against today's code.
+- If a contract assertion seems to contradict an \`AGENTS.md\` rule you encounter (e.g. asserts enforcement where the docs say "bypasses by design"), STOP. Report via SendMessage to "team-lead" and do NOT implement the contradiction into code. The plugin's Phase 0.5 CONTRACT-LINT would normally catch this before dispatch; if it reached you, the lint missed it.
+- NEVER edit \`validation-contract.md\` to make a failing assertion match your implementation. The contract is authoritative input; the implementation follows.
+- NEVER hand-edit \`validation-state.json\`. The \`assertion-proof-guard.mjs\` hook blocks it at the tool level. Only \`execute-assertion.mjs\` can move status to passed.
+
 == RULES ==
 - NEVER spawn sub-agents or orchestration skills
 - NEVER run tmux session management commands

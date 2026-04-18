@@ -1,6 +1,6 @@
 {
   "name": "claude-missions",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "owner": { "name": "Jared Boynton", "url": "https://github.com/jaredboynton" },
   "metadata": {
     "description": "Plugins for orchestrating Factory/droid mission execution in Claude Code: parallel teams, independent validation, critic-gated completion."
