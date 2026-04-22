@@ -30,9 +30,14 @@ function sha256File(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-function isAncestor(sha, workingDir) {
+// Defect 3 (0.4.7): when a proof was produced inside a meta-repo child
+// (proof.childRepo set), ancestry must be checked against that child's HEAD,
+// not the workspace-root HEAD — they're separate git histories. Fall back
+// to workingDir for legacy proofs and single-repo missions.
+function isAncestor(sha, workingDir, childRepo) {
+  const cwd = childRepo ? resolve(workingDir, childRepo) : workingDir;
   try {
-    execSync(`git merge-base --is-ancestor ${sha} HEAD`, { cwd: workingDir, stdio: ["ignore", "pipe", "ignore"] });
+    execSync(`git merge-base --is-ancestor ${sha} HEAD`, { cwd, stdio: ["ignore", "pipe", "ignore"] });
     return true;
   } catch {
     return false;
@@ -70,8 +75,9 @@ function stageAStructural(missionDir, assertions, workingDir) {
       continue;
     }
 
-    if (!isAncestor(proof.commitSha, workingDir)) {
-      issues.push({ id, category: "stale-commit", detail: `proof.commitSha ${proof.commitSha.slice(0, 12)} not ancestor of HEAD` });
+    if (!isAncestor(proof.commitSha, workingDir, proof.childRepo)) {
+      const scope = proof.childRepo ? `${proof.childRepo} HEAD` : "HEAD";
+      issues.push({ id, category: "stale-commit", detail: `proof.commitSha ${proof.commitSha.slice(0, 12)} not ancestor of ${scope}` });
       continue;
     }
 
@@ -116,7 +122,18 @@ function stageBSpotCheck(missionDir, assertions, workingDir, sampleRate) {
 
   for (const id of sample) {
     reExecuted.push(id);
-    const env = { ...process.env, MISSION_EXECUTOR_WRITER: "1" };
+    // CRITIC_SPOT_CHECK=1 tells execute-assertion.mjs to compute the verdict
+    // and proof bundle but NOT write to validation-state.json — critic
+    // verification is a read, not a mutation. Without this flag, a re-exec
+    // that produces a different verdict than the original pass downgrades
+    // the assertion, breaking critic idempotency (defect 2 in 0.4.6).
+    // MISSION_EXECUTOR_WRITER stays set for belt-and-suspenders: if any
+    // future path needs the gate it remains honored.
+    const env = {
+      ...process.env,
+      MISSION_EXECUTOR_WRITER: "1",
+      CRITIC_SPOT_CHECK: "1",
+    };
     const r = spawnSync("node", [executeScript, missionDir, `--id=${id}`], {
       encoding: "utf8",
       env,

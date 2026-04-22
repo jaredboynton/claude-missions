@@ -23,15 +23,19 @@
 //   3 = infrastructure problem (daemon down, binary missing, rg missing)
 //
 // Proof outputs:
-//   .omc/validation/proofs/<id>/stdout.txt
-//   .omc/validation/proofs/<id>/stderr.txt
-//   .omc/validation/proofs/<id>/meta.json  (tool-type, command, expected, observed)
+//   <layoutRoot>/validation/proofs/<id>/stdout.txt
+//   <layoutRoot>/validation/proofs/<id>/stderr.txt
+//   <layoutRoot>/validation/proofs/<id>/meta.json  (tool-type, command, expected, observed)
+// where <layoutRoot> is resolved by hooks/_lib/paths.mjs (default
+// .mission-executor/, or .omc/ if legacy-autodetected).
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { join, resolve, dirname } from "node:path";
+import { join, resolve, dirname, relative, isAbsolute } from "node:path";
 import { execSync, spawnSync } from "node:child_process";
 
 import { recordAssertion } from "./record-assertion.mjs";
+import { proofsDir } from "../hooks/_lib/paths.mjs";
+import { resolveChildRepo } from "./_lib/meta-repo.mjs";
 import { fileURLToPath as _fileURLToPath } from "node:url";
 import { realpathSync as _realpathSync } from "node:fs";
 
@@ -43,6 +47,30 @@ function headSha(workingDir) {
   } catch {
     return null;
   }
+}
+
+// Meta-repo-aware HEAD resolution for proof tagging.
+//
+// Defect 3 (0.4.7): in a workspace with a .meta file listing child repos
+// that have their own .git/, work done in the child produces commits on a
+// separate history. Tagging a proof with workingDir's HEAD makes the
+// critic's `git merge-base --is-ancestor` check at workingDir fail forever
+// against child commits. Consult .meta via resolveChildRepo(); when the
+// first touchpoint routes into a declared child, return that child's HEAD
+// + name. Callers persist `childRepo` on the proof so the critic knows
+// which repo to ask for ancestry.
+function headShaForProof(workingDir, touchpoints) {
+  const first = Array.isArray(touchpoints) && touchpoints.length > 0 ? touchpoints[0] : null;
+  const child = first ? resolveChildRepo(first, workingDir) : null;
+  if (child) {
+    try {
+      const sha = execSync("git rev-parse HEAD", {
+        cwd: child.path, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+      if (sha) return { sha, childRepo: child.name };
+    } catch { /* fall through to workingDir HEAD */ }
+  }
+  return { sha: headSha(workingDir) || "unknown", childRepo: null };
 }
 
 function loadMission(missionPath) {
@@ -964,7 +992,10 @@ function dispatchShellGeneric(ctx, origTool) {
 // ---- Main ------------------------------------------------------------------
 
 function writeProofBundle(missionDir, id, result) {
-  const base = join(missionDir, ".omc", "validation", "proofs", id);
+  // v0.5.0: proofs now land under the project-scoped layoutRoot()/validation/
+  // (resolved by hooks/_lib/paths.mjs) instead of the mission-relative
+  // .omc/validation/ path. Legacy OMC users auto-detect back to .omc/.
+  const base = proofsDir(id);
   mkdirSync(base, { recursive: true });
   const stdoutPath = join(base, "stdout.txt");
   const stderrPath = join(base, "stderr.txt");
@@ -979,10 +1010,7 @@ function writeProofBundle(missionDir, id, result) {
     executedAt: new Date().toISOString(),
   };
   writeFileSync(join(base, "meta.json"), JSON.stringify(meta, null, 2) + "\n");
-  return {
-    stdoutPath: join(".omc", "validation", "proofs", id, "stdout.txt"),
-    stderrPath: join(".omc", "validation", "proofs", id, "stderr.txt"),
-  };
+  return { stdoutPath, stderrPath };
 }
 
 function executeAssertion(missionPath, opts = {}) {
@@ -1110,7 +1138,6 @@ function executeAssertion(missionPath, opts = {}) {
     return { ok: false, id, status: "blocked", message: result.message, exitCode: 2 };
   }
 
-  const commitSha = headSha(ctx.workingDir) || "unknown";
   let touchpoints = touchpointsForAssertion(features, id);
   // Fallback: for shell-style assertions (grep/rg/find/aws), feature
   // descriptions rarely cite source-file paths. Infer touchpoints from
@@ -1125,7 +1152,36 @@ function executeAssertion(missionPath, opts = {}) {
   if (touchpoints.length === 0) {
     touchpoints = [`assertion:${id}:tool=${result.toolType}`];
   }
+  // Resolve commit SHA AFTER touchpoints so meta-repo detection can route
+  // into the child that actually owns the work (defect 3 fix).
+  const { sha: commitSha, childRepo } = headShaForProof(ctx.workingDir, touchpoints);
   const { stdoutPath, stderrPath } = writeProofBundle(dir, id, result);
+
+  // Defect 2 (0.4.7): when the critic's Stage B spot-checks a passed
+  // assertion by spawning this script with CRITIC_SPOT_CHECK=1, we compute
+  // the verdict and proof bundle but MUST NOT touch validation-state.json.
+  // Writing here would flip a previously-passed assertion to failed whenever
+  // the re-exec happens to produce exit != 0 (common for evidence that the
+  // dispatcher parses differently than the original record path), causing
+  // idempotency loss across successive critic runs.
+  //
+  // The proof bundle under .omc/validation/proofs/<id>/ is still written:
+  // it is an idempotent side output, and having a fresh bundle on disk is
+  // useful for operator diagnosis without affecting authoritative state.
+  if (process.env.CRITIC_SPOT_CHECK === "1") {
+    return {
+      ok: true,
+      id,
+      status: result.status,
+      toolType: result.toolType,
+      commitSha,
+      childRepo: childRepo || null,
+      exitCode: result.status === "passed" ? 0 : 1,
+      expected: result.expected,
+      observed: { exitCode: result.exitCode, stdoutPath, stderrPath },
+      spotCheckOnly: true,
+    };
+  }
 
   // Authorize the proof write via env var that assertion-proof-guard hook checks.
   process.env.MISSION_EXECUTOR_WRITER = "1";
@@ -1142,6 +1198,7 @@ function executeAssertion(missionPath, opts = {}) {
     "stderr-path": stderrPath,
     touchpoints: touchpoints.join(","),
     "working-dir": ctx.workingDir,
+    ...(childRepo ? { "child-repo": childRepo } : {}),
   });
 
   // record-assertion rejects passed-without-proof; ensure we only proceed when
@@ -1156,6 +1213,7 @@ function executeAssertion(missionPath, opts = {}) {
     status: result.status,
     toolType: result.toolType,
     commitSha,
+    childRepo: childRepo || null,
     exitCode: result.status === "passed" ? 0 : 1,
     expected: result.expected,
     observed: {

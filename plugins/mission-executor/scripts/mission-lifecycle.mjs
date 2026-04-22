@@ -1,219 +1,91 @@
 #!/usr/bin/env node
-// Mission lifecycle state manager. Writes / clears the marker that
-// autopilot-lock.mjs reads to enforce non-stopping execution.
+// v0.5.0: thin delegator to mission-cli.mjs. Kept for back-compat with
+// existing invocations (block messages in autopilot-lock, suggestNextAction
+// outputs, ad-hoc operator shell commands). 1.0.0 may delete this file.
+//
+// Arg-surface parity: every subcommand here maps 1:1 to a mission-cli.mjs
+// subcommand with equivalent semantics and exit codes. Default --session-id
+// comes from the three-tier resolver (see scripts/_lib/resolve-sid.sh) when
+// not passed explicitly.
 //
 // Usage:
-//   node mission-lifecycle.mjs start <mission-path>          # Phase 0 entry
-//   node mission-lifecycle.mjs phase <phase-name>            # Phase transition
-//   node mission-lifecycle.mjs complete                      # Phase 7 exit
-//   node mission-lifecycle.mjs abort                         # user-invoked escape
+//   node mission-lifecycle.mjs start <mission-path>          # -> mission-cli.mjs start
+//   node mission-lifecycle.mjs phase <phase-name>            # -> mission-cli.mjs phase
+//   node mission-lifecycle.mjs complete [--force]            # -> mission-cli.mjs complete
+//   node mission-lifecycle.mjs abort                         # -> mission-cli.mjs abort
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { join, resolve, dirname } from "node:path";
-import { fileURLToPath as _fileURLToPath } from "node:url";
-import { realpathSync as _realpathSync } from "node:fs";
+import { spawnSync, execFileSync } from "node:child_process";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { readFileSync, existsSync } from "node:fs";
 
-const STATE_REL = ".omc/state/mission-executor-state.json";
-const ABORT_REL = ".omc/state/mission-executor-abort";
+const HERE = dirname(fileURLToPath(import.meta.url));
+const MCLI = join(HERE, "mission-cli.mjs");
 
-function stateDir(missionPath) {
-  // Store state next to the working directory so autopilot-lock can find it
-  // regardless of mission path. Resolved via working_directory.txt.
-  const wd = (() => {
-    if (!missionPath) return process.cwd();
-    const wdPath = join(resolve(missionPath), "working_directory.txt");
-    if (existsSync(wdPath)) return readFileSync(wdPath, "utf8").trim();
-    return process.cwd();
-  })();
-  return wd;
-}
-
-function readState(workingDir) {
-  const p = join(workingDir, STATE_REL);
-  if (!existsSync(p)) return null;
-  try { return JSON.parse(readFileSync(p, "utf8")); }
-  catch { return null; }
-}
-
-function writeState(workingDir, state) {
-  const p = join(workingDir, STATE_REL);
-  mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(state, null, 2) + "\n");
-  return p;
-}
-
-function start(missionPath) {
-  const mp = resolve(missionPath);
-  const wd = stateDir(mp);
-  const state = {
-    active: true,
-    missionPath: mp,
-    workingDirectory: wd,
-    phase: "0-validate",
-    startedAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  };
-  const p = writeState(wd, state);
-  return { ok: true, statePath: p, state };
-}
-
-function phase(phaseName) {
-  const wd = process.cwd();
-  // Walk up to find state file.
-  let cur = wd;
-  for (let i = 0; i < 8; i++) {
-    const p = join(cur, STATE_REL);
-    if (existsSync(p)) {
-      const state = JSON.parse(readFileSync(p, "utf8"));
-      state.phase = phaseName;
-      state.updatedAt = new Date().toISOString();
-      writeFileSync(p, JSON.stringify(state, null, 2) + "\n");
-      return { ok: true, state };
-    }
-    const parent = dirname(cur);
-    if (parent === cur) break;
-    cur = parent;
-  }
-  return { ok: false, error: "mission state not found; run 'start' first" };
-}
-
-// Complete a mission. GATED: refuses to flip state.active=false unless every
-// completion criterion is met (all assertions passed+proof, all features
-// completed, state.json says "completed"). This prevents the orchestrator
-// from self-declaring completion without evidence. An operator who needs
-// to force-complete a mission should create .omc/state/mission-executor-abort
-// first (which bypasses the Stop hook) -- the complete gate is intentional.
-//
-// Override: pass --force to skip the gate. Logged loudly. Use only when
-// completion criteria themselves are corrupt (e.g., mission spec bug).
-function complete({ force = false } = {}) {
-  const wd = process.cwd();
-  let cur = wd;
-  for (let i = 0; i < 8; i++) {
-    const p = join(cur, STATE_REL);
-    if (existsSync(p)) {
-      const state = JSON.parse(readFileSync(p, "utf8"));
-
-      if (!force && state.missionPath) {
-        const check = _checkCompletion(state.missionPath);
-        if (!check.complete) {
-          return {
-            ok: false,
-            error: "completion-gate",
-            reason: check.reason,
-            detail: check.detail || null,
-            hint: [
-              "Refusing to flip state.active=false because completion criteria are unmet.",
-              "Run the suggested next-action from autopilot-lock's block message, or pass",
-              "--force if you are recovering a corrupt mission-spec state (logged loudly).",
-            ].join(" "),
-          };
-        }
-      }
-
-      state.active = false;
-      state.phase = "complete";
-      state.completedAt = new Date().toISOString();
-      if (force) state.forcedComplete = true;
-      writeFileSync(p, JSON.stringify(state, null, 2) + "\n");
-      return { ok: true, state, forced: !!force };
-    }
-    const parent = dirname(cur);
-    if (parent === cur) break;
-    cur = parent;
-  }
-  return { ok: false, error: "mission state not found" };
-}
-
-// Completion-criteria check. Inlined here (rather than imported from
-// hooks/_lib/mission-state.mjs) so this script has no hook-layer dependency
-// and can be run as a pure CLI utility.
-function _checkCompletion(missionPath) {
+// Resolve session-id by sourcing resolve-sid.sh. If stdin isn't a tty the
+// resolver will also consume it — our caller shouldn't be piping JSON into
+// mission-lifecycle unless they want to set session-id via Tier 2.
+function resolveSid() {
   try {
-    const vsPath = join(missionPath, "validation-state.json");
-    const fsPath = join(missionPath, "features.json");
-    const stPath = join(missionPath, "state.json");
-    if (!existsSync(vsPath)) return { complete: false, reason: "validation-state.json missing" };
-    if (!existsSync(fsPath)) return { complete: false, reason: "features.json missing" };
-    if (!existsSync(stPath)) return { complete: false, reason: "state.json missing" };
-    const vs = JSON.parse(readFileSync(vsPath, "utf8"));
-    const fsDoc = JSON.parse(readFileSync(fsPath, "utf8"));
-    const st = JSON.parse(readFileSync(stPath, "utf8"));
-    const assertions = vs.assertions || {};
-    const counts = { total: 0, passed: 0, failed: 0, stale: 0, pending: 0, proofLess: 0 };
-    const failedIds = []; const staleIds = []; const proofLessIds = [];
-    for (const [id, a] of Object.entries(assertions)) {
-      counts.total++;
-      const s = a.status || "pending";
-      if (s === "passed") {
-        if (!a.proof || !a.proof.commitSha) { counts.proofLess++; proofLessIds.push(id); }
-        else counts.passed++;
-      } else if (s === "failed") { counts.failed++; failedIds.push(id); }
-      else if (s === "stale") { counts.stale++; staleIds.push(id); }
-      else counts.pending++;
-    }
-    const features = fsDoc.features || [];
-    const pendingFeatures = features.filter((f) => f.status !== "completed");
-    const reasons = [];
-    if (counts.failed > 0) reasons.push(`${counts.failed} failed assertion(s)`);
-    if (counts.stale > 0) reasons.push(`${counts.stale} stale assertion(s)`);
-    if (counts.pending > 0) reasons.push(`${counts.pending} pending assertion(s)`);
-    if (counts.proofLess > 0) reasons.push(`${counts.proofLess} passed-without-proof assertion(s)`);
-    if (pendingFeatures.length > 0) reasons.push(`${pendingFeatures.length} feature(s) not completed`);
-    if (st.state !== "completed") reasons.push(`state.json is '${st.state}', not 'completed'`);
-    if (reasons.length === 0) return { complete: true };
-    return {
-      complete: false,
-      reason: reasons.join("; "),
-      detail: { counts, failedIds: failedIds.slice(0, 5), staleIds: staleIds.slice(0, 5), proofLessIds: proofLessIds.slice(0, 5), pendingFeatures: pendingFeatures.slice(0, 5).map((f) => f.id) },
-    };
-  } catch (e) {
-    return { complete: false, reason: `completion check failed: ${e.message}` };
+    const out = execFileSync("sh", ["-c", `. "${HERE}/_lib/resolve-sid.sh" && resolve_sid`], {
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf8",
+      env: { ...process.env, CLAUDE_PLUGIN_ROOT: process.env.CLAUDE_PLUGIN_ROOT || join(HERE, "..") },
+    });
+    return (out || "").trim();
+  } catch {
+    return "";
   }
 }
 
-function abort() {
-  const wd = process.cwd();
-  let cur = wd;
-  for (let i = 0; i < 8; i++) {
-    const p = join(cur, STATE_REL);
-    if (existsSync(p)) {
-      const abortPath = join(cur, ABORT_REL);
-      mkdirSync(dirname(abortPath), { recursive: true });
-      writeFileSync(abortPath, new Date().toISOString() + "\n");
-      return { ok: true, abortPath };
-    }
-    const parent = dirname(cur);
-    if (parent === cur) break;
-    cur = parent;
+function passThrough(sub, args) {
+  let sid = null;
+  const forwarded = [];
+  for (const a of args) {
+    if (a.startsWith("--session-id=")) sid = a.slice("--session-id=".length);
+    else forwarded.push(a);
   }
-  return { ok: false, error: "mission state not found" };
+  if (!sid) sid = resolveSid();
+  const cli = [sub, ...forwarded];
+  if (sid) cli.push(`--session-id=${sid}`);
+  const r = spawnSync(process.execPath, [MCLI, ...cli], { stdio: "inherit" });
+  process.exit(r.status ?? 1);
 }
 
-const isMain = (() => { try { return !!process.argv[1] && _fileURLToPath(import.meta.url) === _realpathSync(process.argv[1]); } catch { return false; } })();
-if (isMain) {
-  const cmd = process.argv[2];
-  const arg = process.argv[3];
-  let result;
-  switch (cmd) {
-    case "start":
-      if (!arg) { process.stderr.write("Usage: node mission-lifecycle.mjs start <mission-path>\n"); process.exit(1); }
-      result = start(arg); break;
-    case "phase":
-      if (!arg) { process.stderr.write("Usage: node mission-lifecycle.mjs phase <phase-name>\n"); process.exit(1); }
-      result = phase(arg); break;
-    case "complete": {
-      const force = process.argv.includes("--force");
-      result = complete({ force });
-      break;
-    }
-    case "abort": result = abort(); break;
-    default:
-      process.stderr.write("Usage: node mission-lifecycle.mjs start|phase|complete [--force]|abort [arg]\n");
-      process.exit(1);
-  }
-  process.stdout.write(JSON.stringify(result) + "\n");
-  process.exit(result.ok ? 0 : 1);
+const [sub, ...rest] = process.argv.slice(2);
+
+switch (sub) {
+  case "start":
+  case "phase":
+  case "complete":
+  case "abort":
+  case "status":
+  case "attach":
+  case "detach":
+  case "resolve":
+  case "is-attached":
+    passThrough(sub, rest);
+    break;
+  case "--help":
+  case "-h":
+  case undefined:
+    process.stdout.write([
+      "mission-lifecycle.mjs <subcommand> [args]  (delegator -> mission-cli.mjs)",
+      "Subcommands: start, phase, complete, abort, status, attach, detach, resolve, is-attached",
+      "All forward to scripts/mission-cli.mjs with equivalent args + auto-resolved --session-id.",
+      "See scripts/mission-cli.mjs --help for the authoritative contract.",
+    ].join("\n") + "\n");
+    process.exit(sub ? 0 : 1);
+  default:
+    process.stderr.write(`mission-lifecycle.mjs: unknown subcommand '${sub}'\n`);
+    process.exit(1);
 }
 
-export { start, phase, complete, abort, readState };
+// Exports preserved for any existing importers. In-process they now delegate
+// to mission-cli.mjs via spawn since the data shapes have changed.
+const REMOVED = "mission-lifecycle.mjs in-process API removed in v0.5.0; exec mission-cli.mjs instead";
+export function start() { throw new Error(REMOVED); }
+export function phase() { throw new Error(REMOVED); }
+export function complete() { throw new Error(REMOVED); }
+export function abort() { throw new Error(REMOVED); }
+export { loadMissionStateFromCwd as readState } from "../hooks/_lib/mission-state.mjs";

@@ -25,7 +25,9 @@
 // To unstub:
 //   1. Land a worker-return contract spec (see docs/worker-return-contract.md
 //      -- not yet written).
-//   2. Update workers to write .omc/handoffs-inbox/<worker-id>.json on shutdown.
+//   2. Update workers to write <handoffsInboxDir()>/<worker-id>.json on shutdown
+//      (path resolved via hooks/_lib/paths.mjs — legacy autodetect keeps the
+//      `.omc/handoffs-inbox/` path intact for existing OMC installs).
 //   3. Replace this stub with real read-inbox + write-handoff logic.
 
 import { writeFileSync, mkdirSync, existsSync } from "node:fs";

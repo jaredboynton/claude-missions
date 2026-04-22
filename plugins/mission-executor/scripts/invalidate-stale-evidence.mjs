@@ -18,6 +18,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { execSync } from "node:child_process";
+import { proofsDir } from "../hooks/_lib/paths.mjs";
 import { fileURLToPath as _fileURLToPath } from "node:url";
 import { realpathSync as _realpathSync } from "node:fs";
 
@@ -59,7 +60,10 @@ function touchpointChangedSince(touchpoints, proofSha, workingDir) {
 }
 
 function archiveBundle(missionDir, assertionId, proofSha) {
-  const base = join(missionDir, ".omc", "validation", "proofs", assertionId);
+  // v0.5.0: proofs live at layoutRoot()/validation/proofs/<id>/ (via paths.mjs).
+  // missionDir is kept as the arg for backward-compat call signature but is
+  // no longer used to derive the proof location.
+  const base = proofsDir(assertionId);
   if (!existsSync(base)) return null;
   const archive = join(base, "archive", proofSha || "unknown");
   mkdirSync(archive, { recursive: true });

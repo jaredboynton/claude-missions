@@ -50,8 +50,8 @@ function walkAgentsMd(root) {
   // the kep team studies but does not govern; their AGENTS.md rules don't
   // constrain kep's contract.
   const skip = new Set([
-    "node_modules", ".git", "dist", "build", ".omc", ".factory",
-    ".next", "coverage", ".discovery", "vendor", ".cache",
+    "node_modules", ".git", "dist", "build", ".omc", ".mission-executor",
+    ".factory", ".next", "coverage", ".discovery", "vendor", ".cache",
   ]);
   const stack = [root];
   while (stack.length) {

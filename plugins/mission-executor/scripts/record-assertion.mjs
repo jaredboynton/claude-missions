@@ -94,6 +94,13 @@ function buildProof(args, missionPath) {
     ? args.touchpoints.split(",").map((s) => s.trim()).filter(Boolean)
     : [];
 
+  // Defect 3 (0.4.7): when executeAssertion detects the work lives in a
+  // meta-repo child (via .meta), it passes --child-repo so the critic can
+  // pick the right repo for its ancestry check. Omit the field entirely
+  // for single-repo proofs so we don't bloat the schema when not needed.
+  const childRepo = typeof args["child-repo"] === "string" && args["child-repo"]
+    ? args["child-repo"]
+    : null;
   return {
     commitSha: args["commit-sha"],
     toolType: args["tool-type"],
@@ -106,6 +113,7 @@ function buildProof(args, missionPath) {
     touchpoints,
     executedAt: new Date().toISOString(),
     executor: args.executor || "execute-assertion.mjs",
+    ...(childRepo ? { childRepo } : {}),
   };
 }
 
@@ -153,6 +161,17 @@ function recordAssertion(missionPath, args) {
   const entry = vs.assertions[id] || {};
   entry.status = status;
   if (evidence) entry.evidence = evidence;
+
+  // Defect 4 (0.4.7): if a `passed` write omits --evidence, prior evidence
+  // is silently preserved. That can leak a stale dispatcher-error string
+  // into an authoritative proof. Warn loudly so operators see the carry.
+  if (status === "passed" && (!evidence || evidence === true)) {
+    const priorEv = typeof entry.evidence === "string" ? entry.evidence : "(none)";
+    const truncated = priorEv.length > 120 ? priorEv.slice(0, 117) + "..." : priorEv;
+    process.stderr.write(
+      `record-assertion: warn: --status=passed recorded for ${id} without --evidence; prior evidence preserved: ${truncated}\n`,
+    );
+  }
 
   if (status === "passed") {
     const milestone = milestoneMap[id];
