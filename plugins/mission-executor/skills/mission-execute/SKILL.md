@@ -197,7 +197,49 @@ parallel execution batches (those in `likely-done-verify-first`,
 
 ### Phase 3: EXECUTE
 
-For each batch, use Claude Code native teams:
+For each batch, use Claude Code native teams. **Prefer the `/team` slash
+command if the runtime exposes it** (OMC / oh-my-claudecode runtimes do);
+otherwise hand-roll via `TeamCreate` + `Agent()`.
+
+#### Preferred path: `/oh-my-claudecode:team` (when available)
+
+If the active runtime exposes the `/oh-my-claudecode:team` slash command
+(detectable via the available-skills system reminder at session start), the
+orchestrator SHOULD dispatch each batch through that skill rather than
+hand-rolling the team primitives. The `/team` skill layers stage-aware
+agent routing, handoff documents, state-file persistence, and shutdown
+protocol on top of `TeamCreate` + `Agent()` — all of which this SKILL
+would otherwise have to reproduce inline. Dispatching to `/team`
+eliminates duplicated orchestration and keeps the team runtime version
+aligned with the rest of the user's OMC install.
+
+Invocation shape:
+```
+Skill("oh-my-claudecode:team", args=<task description + pre-computed
+      feature batch + exec-worker-type + boundaries>)
+```
+
+The orchestrator passes the batch through as the task description; `/team`
+decomposes internally, pre-assigns owners, spawns teammates, and drives
+the staged pipeline (team-plan -> team-exec -> team-verify -> team-fix).
+The orchestrator monitors progress via `SendMessage` checkpoints as a
+team-lead peer rather than managing every primitive call directly. On
+completion, the orchestrator takes the team's `whatWasDone` handoff and
+plumbs it into Phase 3's state write-back + Phase 4 VERIFY.
+
+This path is preferred because it (a) avoids duplicating the ~800-line
+team runtime contract in this SKILL, (b) picks up OMC team improvements
+automatically (stage routing, worktree isolation, dynamic scaling,
+role-routing configs, cancellation integration), (c) interoperates
+cleanly with `/oh-my-claudecode:cancel` so mid-mission cancel reaches
+workers, and (d) surfaces standard OMC state files (`state_read mode=team`)
+for operator visibility.
+
+#### Fallback path: hand-rolled team (when `/team` is not available)
+
+If `/team` is not exposed (plain Claude Code without OMC, or a stripped
+environment), hand-roll the team primitives directly. This is the
+pre-0.4.1 default and remains the reference behavior:
 
 ```
 TeamCreate("mission-batch-N")
@@ -219,6 +261,11 @@ Spawn workers with Agent(
 Monitor until all tasks complete or fail
 Shutdown workers -> TeamDelete
 ```
+
+Either path must respect the mission's Phase 3 contract: workers commit
+to git, the runner writes back features.json status via
+`sync-features-state.mjs`, and Phase 4 VERIFY drives the authoritative
+pass/fail via `execute-assertion.mjs`.
 
 **Worker Preamble** (injected into every worker):
 - Mission AGENTS.md boundaries (verbatim NEVER rules)

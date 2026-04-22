@@ -30,6 +30,13 @@ the installed version.
 
 ## Rules specific to this plugin
 
+- Phase 3 EXECUTE MUST prefer `/oh-my-claudecode:team` when the runtime
+  exposes it. Only hand-roll `TeamCreate` + `Agent()` as a fallback (plain
+  Claude Code without OMC, or stripped environments). The `/team` skill
+  already implements stage routing, shutdown protocol, handoff docs, and
+  state files; hand-rolling duplicates that contract inline and drifts
+  from the OMC team runtime as it evolves. Detect availability via the
+  available-skills system-reminder at session start.
 - Never hand-write `validation-state.json`. `assertion-proof-guard.mjs` blocks
   it at the PreToolUse layer. Use `record-assertion.mjs` via
   `execute-assertion.mjs`.
