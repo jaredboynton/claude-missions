@@ -18,92 +18,18 @@
 // Escape hatch: if the user creates .omc/state/mission-executor-abort,
 // the lock releases and allows stop. This lets a human abort a stuck
 // pipeline without killing the session.
+//
+// IMPORTANT: Stop hooks are flaky in Claude Code (Anthropic issues
+// #22925, #29881, #8615, #12436). This hook DOES NOT infinite-loop on
+// consecutive blocks because we check `stop_hook_active` in the input
+// per the official FAQ: after a block, the next Stop event carries
+// stop_hook_active=true and we short-circuit to allow stop. That means
+// "block" fires at most once per stall — subsequent enforcement must
+// come from PreToolUse hooks that see the next tool call.
 
-import { readFileSync, existsSync, unlinkSync } from "node:fs";
-import { join, dirname } from "node:path";
-
-const STATE_REL = ".omc/state/mission-executor-state.json";
-const ABORT_REL = ".omc/state/mission-executor-abort";
-
-function walkUpForState(start) {
-  let cur = start;
-  for (let i = 0; i < 8; i++) {
-    const p = join(cur, STATE_REL);
-    if (existsSync(p)) return p;
-    const parent = dirname(cur);
-    if (parent === cur) break;
-    cur = parent;
-  }
-  return null;
-}
-
-function walkUpForAbort(start) {
-  let cur = start;
-  for (let i = 0; i < 8; i++) {
-    const p = join(cur, ABORT_REL);
-    if (existsSync(p)) return p;
-    const parent = dirname(cur);
-    if (parent === cur) break;
-    cur = parent;
-  }
-  return null;
-}
-
-function checkCompletion(missionPath) {
-  try {
-    const vsPath = join(missionPath, "validation-state.json");
-    const fsPath = join(missionPath, "features.json");
-    const stPath = join(missionPath, "state.json");
-
-    if (!existsSync(vsPath)) return { complete: false, reason: "validation-state.json missing" };
-    if (!existsSync(fsPath)) return { complete: false, reason: "features.json missing" };
-    if (!existsSync(stPath)) return { complete: false, reason: "state.json missing" };
-
-    const vs = JSON.parse(readFileSync(vsPath, "utf8"));
-    const fs = JSON.parse(readFileSync(fsPath, "utf8"));
-    const st = JSON.parse(readFileSync(stPath, "utf8"));
-
-    const assertions = vs.assertions || {};
-    const counts = { total: 0, passed: 0, failed: 0, stale: 0, pending: 0, proofLess: 0 };
-    const failedIds = [];
-    const staleIds = [];
-    const proofLessIds = [];
-    for (const [id, a] of Object.entries(assertions)) {
-      counts.total++;
-      const status = a.status || "pending";
-      if (status === "passed") {
-        if (!a.proof || !a.proof.commitSha) {
-          counts.proofLess++;
-          proofLessIds.push(id);
-        } else {
-          counts.passed++;
-        }
-      } else if (status === "failed") { counts.failed++; failedIds.push(id); }
-      else if (status === "stale") { counts.stale++; staleIds.push(id); }
-      else counts.pending++;
-    }
-
-    const features = fs.features || [];
-    const pendingFeatures = features.filter((f) => f.status !== "completed");
-
-    const reasons = [];
-    if (counts.failed > 0) reasons.push(`${counts.failed} failed assertion(s): ${failedIds.slice(0, 3).join(", ")}${failedIds.length > 3 ? "..." : ""}`);
-    if (counts.stale > 0) reasons.push(`${counts.stale} stale assertion(s) need re-run: ${staleIds.slice(0, 3).join(", ")}${staleIds.length > 3 ? "..." : ""}`);
-    if (counts.pending > 0) reasons.push(`${counts.pending} pending assertion(s)`);
-    if (counts.proofLess > 0) reasons.push(`${counts.proofLess} passed-without-proof assertion(s): ${proofLessIds.slice(0, 3).join(", ")}${proofLessIds.length > 3 ? "..." : ""}`);
-    if (pendingFeatures.length > 0) reasons.push(`${pendingFeatures.length} feature(s) not completed: ${pendingFeatures.slice(0, 3).map((f) => f.id).join(", ")}${pendingFeatures.length > 3 ? "..." : ""}`);
-    if (st.state !== "completed") reasons.push(`mission state.json is '${st.state}', not 'completed'`);
-
-    if (reasons.length === 0) return { complete: true };
-    return {
-      complete: false,
-      reason: reasons.join("; "),
-      detail: { counts, failedIds, staleIds, proofLessIds, pendingFeatures: pendingFeatures.map((f) => f.id) },
-    };
-  } catch (e) {
-    return { complete: false, reason: `completion check failed: ${e.message}` };
-  }
-}
+import { readFileSync, unlinkSync } from "node:fs";
+import { checkCompletion, loadMissionState, walkUpForAbort } from "./_lib/mission-state.mjs";
+import { audit } from "./_lib/audit.mjs";
 
 async function main() {
   let input = "";
@@ -111,39 +37,46 @@ async function main() {
 
   let parsed;
   try { parsed = JSON.parse(input); } catch {
+    audit("autopilot-lock", { decision: "allow", reason: "unparseable-input" });
+    process.stdout.write(JSON.stringify({}));
+    return;
+  }
+
+  // Official FAQ: if the previous Stop already blocked, the next call carries
+  // stop_hook_active=true. We MUST allow stop in that case to avoid an
+  // infinite recursion. Subsequent enforcement runs on PreToolUse.
+  if (parsed.stop_hook_active === true) {
+    audit("autopilot-lock", { decision: "allow", reason: "stop_hook_active-shortcircuit" });
     process.stdout.write(JSON.stringify({}));
     return;
   }
 
   const cwd = process.env.CLAUDE_WORKING_DIR || process.cwd();
-  const statePath = walkUpForState(cwd);
-  if (!statePath) {
-    process.stdout.write(JSON.stringify({}));
-    return;
-  }
-
-  let state;
-  try { state = JSON.parse(readFileSync(statePath, "utf8")); }
-  catch {
+  const { state, statePath } = loadMissionState(cwd);
+  if (!state) {
+    audit("autopilot-lock", { decision: "allow", reason: "no-state" });
     process.stdout.write(JSON.stringify({}));
     return;
   }
 
   if (!state.active || !state.missionPath) {
+    audit("autopilot-lock", { decision: "allow", reason: "inactive" });
     process.stdout.write(JSON.stringify({}));
     return;
   }
 
-  // Abort escape hatch
+  // Abort escape hatch: manually-created flag file.
   const abortPath = walkUpForAbort(cwd);
   if (abortPath) {
     try { unlinkSync(abortPath); } catch {}
+    audit("autopilot-lock", { decision: "allow", reason: "abort-flag" });
     process.stdout.write(JSON.stringify({}));
     return;
   }
 
   const check = checkCompletion(state.missionPath);
   if (check.complete) {
+    audit("autopilot-lock", { decision: "allow", reason: "complete" });
     process.stdout.write(JSON.stringify({}));
     return;
   }
@@ -160,13 +93,22 @@ async function main() {
     "  - pending assertions       -> run execute-assertion.mjs on each",
     "  - passed-without-proof     -> run invalidate-stale-evidence.mjs, then execute-assertion.mjs",
     "  - features not completed   -> run sync-features-state.mjs or mark via reconcile-external-work.mjs --apply",
-    "  - state.json != completed  -> Phase 7: set state=completed, append progress_log, re-run validate-mission.mjs as exit gate",
+    "  - state.json != completed  -> Phase 7: run mission-lifecycle.mjs complete (now precondition-gated)",
     "",
     "Do NOT use AskUserQuestion (blocked by no-ask-during-mission hook).",
     "Do NOT write a summary and stop -- keep executing until all criteria are met.",
     "",
+    "Note: Stop hooks fire unreliably in Claude Code (upstream issues #22925, #29881).",
+    "This block fires at most once per stall; PreToolUse hooks catch the next tool call.",
+    "",
     "Manual abort: user may create .omc/state/mission-executor-abort to release the lock.",
   ].join("\n");
+
+  audit("autopilot-lock", {
+    decision: "block",
+    blocker: check.reason,
+    statePath,
+  });
 
   process.stdout.write(JSON.stringify({
     decision: "block",
@@ -176,5 +118,6 @@ async function main() {
 
 main().catch((e) => {
   process.stderr.write(`autopilot-lock error: ${e.message}\n`);
+  audit("autopilot-lock", { decision: "allow", reason: `error:${e.message}` });
   process.stdout.write(JSON.stringify({}));
 });

@@ -9,17 +9,70 @@ triggers:
   - mission-execute
 ---
 
-# Mission Executor
+# Mission Executor (Claude Code lane)
 
-Fully automated execution of Factory/droid missions. Reads the mission spec, decomposes features into parallel teams, executes, validates every assertion, fixes failures, and loops until a critic confirms 100% pass rate.
+Executes Factory/droid missions FROM CLAUDE CODE. This is the Claude-Code side
+of a dual-runtime system. The Factory droid CLI runtime owns the
+feature→worker→handoff→dismiss loop, scrutiny-validator auto-injection at
+milestone seals, and user-testing-validator auto-injection. This plugin handles:
 
-**AUTOPILOT — the assistant is locked into this pipeline until completion.** The `autopilot-lock.mjs` Stop hook blocks the assistant from ending its turn while a mission is active, and `no-ask-during-mission.mjs` blocks `AskUserQuestion`. Summaries, progress reports, and "what would you like next?" prompts are not valid exits. The mission is complete only when:
+- Phase 0-2: validation, contract-lint, and reconcile of mission state
+- Phase 3: execute via Agent() spawns (three-tier team hierarchy; see Phase 3)
+- Phase 4: assertion verification — `execute-assertion.mjs` is the SOLE path to `passed`
+- Phase 5: critic gate via `critic-evaluator.mjs`
+- Phase 7: completion gate (refuses to flip state.active=false without evidence)
+
+If you need scrutiny / user-testing validators auto-injected at milestone seals,
+run the mission from the droid CLI instead — those validators are owned by the
+Factory runtime, not this plugin. This plugin's `milestone-seal.mjs` will probe
+for them on PATH and exit 2 with guidance if absent, rather than silently
+no-opping.
+
+**AUTOPILOT — multi-layer enforcement.** A single enforcement point is
+unreliable in Claude Code (see "Known Stop-hook limitations" below). This plugin
+layers:
+
+1. **PreToolUse hooks** (reliable): `assertion-proof-guard` and
+   `features-json-guard` deny direct Write/Edit to authoritative state files;
+   `worker-boundary-enforcer` enforces mission AGENTS.md NEVER-rules and
+   injects mission-active status context into the first non-progress tool
+   call of each turn; `no-ask-during-mission` denies `AskUserQuestion` with
+   a concrete next-action hint from `mission-query.mjs`.
+2. **Stop hook** (best-effort): `autopilot-lock` blocks turn-end while the
+   mission has incomplete assertions/features/state. Short-circuits on
+   `stop_hook_active` per Anthropic's FAQ (avoids infinite loop).
+3. **Lifecycle gate**: `mission-lifecycle.mjs complete` refuses to flip
+   `state.active=false` unless completion criteria are met. Pass `--force`
+   only when the spec itself is corrupt (logged loudly).
+
+The mission is complete only when:
 
 - every assertion in `validation-state.json` is `status=passed` with a `proof` block carrying `commitSha`,
 - every feature in `features.json` is `status=completed`, and
 - `state.json` has `state=completed`.
 
 Escape hatch: the user may create `<working-dir>/.omc/state/mission-executor-abort` to release the lock mid-run.
+
+**Audit log**: every hook invocation appends to
+`<working-dir>/.omc/state/hook-audit.log` with timestamp, hook name, and
+decision. Use this to diagnose whether hooks loaded and fired when a
+mission post-mortem claims enforcement was bypassed.
+
+## Known Stop-hook limitations (Anthropic upstream)
+
+Stop hooks are flaky in Claude Code and cannot be trusted as the only
+enforcement layer. Documented issues:
+
+- `#22925` — Stop fires intermittently; sometimes skips text-only responses
+- `#29881` — silent tool stops skip Stop entirely
+- `#8615` — `decision:block` creates async concurrent request races, not clean blocking
+- `#12436` — `continue:true` blocks can API-400 on thinking blocks
+- `#19643`/`#19432`/`#16538` — `systemMessage`/`additionalContext` injection is broken across several events
+
+This plugin puts the load-bearing enforcement at PreToolUse (fires reliably
+on every tool call) and treats the Stop hook as defense-in-depth. Context
+injection uses both `hookSpecificOutput.additionalContext` AND top-level
+`systemMessage` as redundant paths.
 
 ## Input
 

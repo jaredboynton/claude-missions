@@ -51,10 +51,36 @@ the installed version.
 - Never hand-write `validation-state.json`. `assertion-proof-guard.mjs` blocks
   it at the PreToolUse layer. Use `record-assertion.mjs` via
   `execute-assertion.mjs`.
+- Never hand-write `features.json`. `features-json-guard.mjs` blocks it at
+  the PreToolUse layer. Use `sync-features-state.mjs` (git-HEAD-driven) or
+  `reconcile-external-work.mjs --apply` (proof-gated).
 - Worker claims in tool output (e.g. `VAL-XXX: PASS`) are audit-only and land
   in `.omc/validation/worker-claims.jsonl`. They do NOT flip status.
 - Plugin scripts ignore the git status of the host working directory; they
   read `working_directory.txt` from the mission dir to locate repo state.
+- `mission-lifecycle.mjs complete` is gated. It refuses to flip
+  `state.active=false` unless completion criteria are met. Pass `--force`
+  only when the spec itself is corrupt (logged).
+- Stop hooks in Claude Code are flaky (upstream #22925, #29881, #8615,
+  #12436). This plugin layers enforcement at PreToolUse (reliable) +
+  Stop (best-effort) + lifecycle-gate. When iterating on hooks, do NOT
+  assume Stop alone will catch bypasses; always add PreToolUse-layer
+  enforcement as well.
+- Every hook logs to `<wd>/.omc/state/hook-audit.log` via
+  `hooks/_lib/audit.mjs`. First diagnostic when enforcement appears to
+  be bypassed: `tail .omc/state/hook-audit.log` to verify the hook fired
+  at all. If it didn't, check plugin enablement and Claude Code version
+  compatibility with the `hookSpecificOutput.permissionDecision` schema.
+- `write-handoff.mjs` is a STUB. Worker-return contract (workers writing
+  `.omc/handoffs-inbox/<worker-id>.json` before shutdown) isn't implemented;
+  under `--force` the script writes an advisory handoff marked `_unverified`.
+  Sealed-milestone audits that require verified handoffs should use the
+  droid CLI runtime, not Claude Code.
+- `milestone-seal.mjs` is a STUB. `scrutiny-validator` and
+  `user-testing-validator` are Factory-droid-runtime scripts. The stub
+  probes for them via `DROID_SCRUTINY_BIN` / `DROID_USER_TESTING_BIN`
+  env vars and common install paths; if absent it exits 2 loudly. The
+  droid CLI lane is the canonical place to seal milestones.
 
 ## Tuning `contract-lint.mjs`
 
