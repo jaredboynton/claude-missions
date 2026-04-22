@@ -1,36 +1,38 @@
 #!/usr/bin/env node
-// PostToolUse hook: worker-claim audit log (AUDIT ONLY, never authoritative).
+// PostToolUse hook: worker-claim audit log (AUDIT ONLY).
 //
-// Prior versions of this hook pattern-scraped tool output for "VAL-XXX: PASS"
-// strings and wrote them directly to validation-state.json. That let any
-// worker flip an assertion to passed just by echoing the right string.
-//
-// The hook now appends to .omc/validation/worker-claims.jsonl for forensic
-// audit. It NEVER writes to validation-state.json. Only execute-assertion.mjs
-// (gated by MISSION_EXECUTOR_WRITER=1 and assertion-proof-guard hook) can
-// move a status to passed.
+// v0.5.0: gated on session_id membership in state.attachedSessions[]. Also
+// touches the driver heartbeat file so /detach can detect active drivers
+// (spec §4.3 calls for heartbeat touches in both PreToolUse and PostToolUse).
 
-import { readFileSync, appendFileSync, mkdirSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { appendFileSync, mkdirSync, existsSync, writeFileSync, utimesSync } from "node:fs";
+import { dirname } from "node:path";
+import { loadAttachedMissionState, migrateLegacyAttach } from "./_lib/mission-state.mjs";
+import { claimsLogFile, heartbeatFile, stateBase } from "./_lib/paths.mjs";
+import { audit } from "./_lib/audit.mjs";
 
-const MISSION_STATE_PATH = ".omc/state/mission-executor-state.json";
-const CLAIMS_LOG = ".omc/validation/worker-claims.jsonl";
 const VAL_PATTERN = /\b(VAL-[A-Z]+-\d+[a-z]?)\s*[:|]\s*(PASS|passed|pass|FAIL|failed|fail)\b/gi;
 
-function loadMissionState(cwd) {
-  const statePath = join(cwd, MISSION_STATE_PATH);
-  if (!existsSync(statePath)) return null;
+function touchHeartbeat(sessionId) {
+  if (!sessionId) return;
   try {
-    return JSON.parse(readFileSync(statePath, "utf8"));
-  } catch {
-    return null;
-  }
+    mkdirSync(stateBase(), { recursive: true });
+    const p = heartbeatFile(sessionId);
+    if (existsSync(p)) {
+      const now = new Date();
+      utimesSync(p, now, now);
+    } else {
+      writeFileSync(p, new Date().toISOString());
+    }
+  } catch {}
 }
 
-function appendClaim(missionPath, entry) {
-  const logPath = join(missionPath, CLAIMS_LOG);
-  mkdirSync(dirname(logPath), { recursive: true });
-  appendFileSync(logPath, JSON.stringify(entry) + "\n");
+function appendClaim(entry) {
+  try {
+    const logPath = claimsLogFile();
+    mkdirSync(dirname(logPath), { recursive: true });
+    appendFileSync(logPath, JSON.stringify(entry) + "\n");
+  } catch {}
 }
 
 async function main() {
@@ -38,23 +40,27 @@ async function main() {
   for await (const chunk of process.stdin) input += chunk;
 
   let parsed;
-  try {
-    parsed = JSON.parse(input);
-  } catch {
+  try { parsed = JSON.parse(input); } catch {
     process.stdout.write(JSON.stringify({}));
     return;
   }
 
   const tool_result = parsed.tool_response ?? parsed.tool_result;
   const tool_name = parsed.tool_name;
-  const session_id = parsed.session_id || "unknown";
-  const cwd = process.env.CLAUDE_WORKING_DIR || process.cwd();
-  const state = loadMissionState(cwd);
+  const sessionId = parsed.session_id;
+  const cwd = parsed.cwd || process.env.CLAUDE_WORKING_DIR || process.cwd();
+  const { state, reason } = loadAttachedMissionState({ sessionId, cwd });
 
   if (!state || !state.active || !state.missionPath) {
     process.stdout.write(JSON.stringify({}));
     return;
   }
+
+  if (reason === "legacy-auto-attach-pending") {
+    try { await migrateLegacyAttach({ sessionId, cwd }); } catch {}
+  }
+
+  touchHeartbeat(sessionId);
 
   const output = typeof tool_result === "string" ? tool_result : JSON.stringify(tool_result ?? "");
   const claims = [];
@@ -65,9 +71,8 @@ async function main() {
     const rawStart = Math.max(0, match.index - 40);
     const rawEnd = Math.min(output.length, match.index + match[0].length + 40);
     claims.push({
-      assertionId,
-      claim,
-      sessionId: session_id,
+      assertionId, claim,
+      sessionId: sessionId || "unknown",
       timestamp: new Date().toISOString(),
       toolName: tool_name,
       rawExcerpt: output.slice(rawStart, rawEnd),
@@ -79,12 +84,12 @@ async function main() {
     return;
   }
 
-  for (const claim of claims) appendClaim(state.missionPath, claim);
+  for (const claim of claims) appendClaim(claim);
 
-  // Audit-only: never flips status. Return advisory message to the agent so
-  // they know their claim was logged but is NOT authoritative.
+  audit("validation-tracker", { decision: "logged", count: claims.length, session_id: sessionId });
+
   process.stdout.write(JSON.stringify({
-    message: `[worker-claims] Logged ${claims.length} assertion claim(s) to ${CLAIMS_LOG}. These are AUDIT-ONLY. Only execute-assertion.mjs can move status to passed.`,
+    message: `[worker-claims] Logged ${claims.length} assertion claim(s). These are AUDIT-ONLY. Only execute-assertion.mjs can move status to passed.`,
   }));
 }
 

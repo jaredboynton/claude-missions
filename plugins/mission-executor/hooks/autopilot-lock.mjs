@@ -1,34 +1,17 @@
 #!/usr/bin/env node
 // Stop hook: lock the assistant into mission completion.
 //
-// When /mission-executor:mission-execute is running, mission-lifecycle.mjs
-// writes .omc/state/mission-executor-state.json with active: true. This
-// Stop hook reads that state and BLOCKS the assistant from ending its
-// turn until every completion criterion is met:
+// v0.5.0: enforcement is scoped to sessions in state.attachedSessions[]. A
+// session that didn't /mission-executor:execute is invisible to this hook.
 //
-//   1. validation-state.json: all assertions have status=passed AND a
-//      proof block with commitSha.
-//   2. features.json: every feature has status=completed.
-//   3. state.json: mission state == "completed".
-//
-// If any criterion is unmet, the hook returns { decision: "block", reason }
-// with a precise description of what's still missing. Claude will continue
-// with that context instead of ending the turn.
-//
-// Escape hatch: if the user creates .omc/state/mission-executor-abort,
-// the lock releases and allows stop. This lets a human abort a stuck
-// pipeline without killing the session.
-//
-// IMPORTANT: Stop hooks are flaky in Claude Code (Anthropic issues
-// #22925, #29881, #8615, #12436). This hook DOES NOT infinite-loop on
-// consecutive blocks because we check `stop_hook_active` in the input
-// per the official FAQ: after a block, the next Stop event carries
-// stop_hook_active=true and we short-circuit to allow stop. That means
-// "block" fires at most once per stall — subsequent enforcement must
-// come from PreToolUse hooks that see the next tool call.
+// Hook input stdin: JSON { session_id, stop_hook_active, ... }
+// On block: { decision: "block", reason: "..." }
 
 import { readFileSync, unlinkSync } from "node:fs";
-import { checkCompletion, loadMissionState, walkUpForAbort } from "./_lib/mission-state.mjs";
+import {
+  checkCompletion, loadAttachedMissionState, readAbortFlag, clearAbortFlag,
+  migrateLegacyAttach,
+} from "./_lib/mission-state.mjs";
 import { audit } from "./_lib/audit.mjs";
 
 async function main() {
@@ -43,45 +26,52 @@ async function main() {
   }
 
   // Official FAQ: if the previous Stop already blocked, the next call carries
-  // stop_hook_active=true. We MUST allow stop in that case to avoid an
-  // infinite recursion. Subsequent enforcement runs on PreToolUse.
+  // stop_hook_active=true. Allow stop to avoid infinite recursion.
   if (parsed.stop_hook_active === true) {
     audit("autopilot-lock", { decision: "allow", reason: "stop_hook_active-shortcircuit" });
     process.stdout.write(JSON.stringify({}));
     return;
   }
 
-  const cwd = process.env.CLAUDE_WORKING_DIR || process.cwd();
-  const { state, statePath } = loadMissionState(cwd);
+  const sessionId = parsed.session_id;
+  const cwd = parsed.cwd || process.env.CLAUDE_WORKING_DIR || process.cwd();
+  const { state, statePath, reason } = loadAttachedMissionState({ sessionId, cwd });
+
   if (!state) {
-    audit("autopilot-lock", { decision: "allow", reason: "no-state" });
+    audit("autopilot-lock", { decision: "allow", reason: reason || "no-state", session_id: sessionId });
     process.stdout.write(JSON.stringify({}));
     return;
+  }
+
+  // Legacy auto-attach: fire migration in the background (await briefly so it
+  // completes before the hook exits, but deadline is short).
+  if (reason === "legacy-auto-attach-pending") {
+    try { await migrateLegacyAttach({ sessionId, cwd }); } catch {}
   }
 
   if (!state.active || !state.missionPath) {
-    audit("autopilot-lock", { decision: "allow", reason: "inactive" });
+    audit("autopilot-lock", { decision: "allow", reason: "inactive", session_id: sessionId });
     process.stdout.write(JSON.stringify({}));
     return;
   }
 
-  // Abort escape hatch: manually-created flag file.
-  const abortPath = walkUpForAbort(cwd);
+  // Abort escape hatch
+  const abortPath = readAbortFlag();
   if (abortPath) {
-    try { unlinkSync(abortPath); } catch {}
-    audit("autopilot-lock", { decision: "allow", reason: "abort-flag" });
+    clearAbortFlag();
+    audit("autopilot-lock", { decision: "allow", reason: "abort-flag", session_id: sessionId });
     process.stdout.write(JSON.stringify({}));
     return;
   }
 
   const check = checkCompletion(state.missionPath);
   if (check.complete) {
-    audit("autopilot-lock", { decision: "allow", reason: "complete" });
+    audit("autopilot-lock", { decision: "allow", reason: "complete", session_id: sessionId });
     process.stdout.write(JSON.stringify({}));
     return;
   }
 
-  const reason = [
+  const reasonText = [
     "[autopilot-lock] Mission not complete. Continue executing the /mission-executor:mission-execute pipeline without stopping or asking the user.",
     "",
     `Mission: ${state.missionPath}`,
@@ -89,11 +79,11 @@ async function main() {
     `Blocker: ${check.reason}`,
     "",
     "Required next action depends on what's incomplete:",
-    "  - failed/stale assertions  -> spawn fix workers to correct code, commit, re-run execute-assertion.mjs for those ids",
+    "  - failed/stale assertions  -> spawn fix workers, commit, re-run execute-assertion.mjs for those ids",
     "  - pending assertions       -> run execute-assertion.mjs on each",
     "  - passed-without-proof     -> run invalidate-stale-evidence.mjs, then execute-assertion.mjs",
-    "  - features not completed   -> run sync-features-state.mjs or mark via reconcile-external-work.mjs --apply",
-    "  - state.json != completed  -> Phase 7: run mission-lifecycle.mjs complete (now precondition-gated)",
+    "  - features not completed   -> sync-features-state.mjs or reconcile-external-work.mjs --apply",
+    "  - state.json != completed  -> node scripts/mission-cli.mjs complete --session-id=<sid>",
     "",
     "Do NOT use AskUserQuestion (blocked by no-ask-during-mission hook).",
     "Do NOT write a summary and stop -- keep executing until all criteria are met.",
@@ -101,19 +91,12 @@ async function main() {
     "Note: Stop hooks fire unreliably in Claude Code (upstream issues #22925, #29881).",
     "This block fires at most once per stall; PreToolUse hooks catch the next tool call.",
     "",
-    "Manual abort: user may create .omc/state/mission-executor-abort to release the lock.",
+    "Manual abort: run /mission-executor:abort to release the lock.",
   ].join("\n");
 
-  audit("autopilot-lock", {
-    decision: "block",
-    blocker: check.reason,
-    statePath,
-  });
+  audit("autopilot-lock", { decision: "block", blocker: check.reason, statePath, session_id: sessionId });
 
-  process.stdout.write(JSON.stringify({
-    decision: "block",
-    reason,
-  }));
+  process.stdout.write(JSON.stringify({ decision: "block", reason: reasonText }));
 }
 
 main().catch((e) => {

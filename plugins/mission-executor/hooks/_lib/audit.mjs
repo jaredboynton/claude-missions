@@ -15,33 +15,27 @@
 // Log format: one JSON line per event with ts, hook, and arbitrary payload.
 
 import { appendFileSync, statSync, renameSync, mkdirSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { dirname } from "node:path";
+import { auditLogFile } from "./paths.mjs";
 
 const MAX_BYTES = 1_048_576; // 1 MiB
-const LOG_REL = ".omc/state/hook-audit.log";
 
 function resolveLogPath() {
-  const base =
-    process.env.CLAUDE_PROJECT_DIR ||
-    process.env.CLAUDE_WORKING_DIR ||
-    process.cwd();
-  return join(base, LOG_REL);
+  try { return auditLogFile(); }
+  catch { return null; }  // projectRoot unresolvable; skip logging
 }
 
 function rotateIfLarge(path) {
   try {
     const s = statSync(path);
-    if (s.size > MAX_BYTES) {
-      renameSync(path, path + ".1");
-    }
-  } catch {
-    // missing file: normal first-run case
-  }
+    if (s.size > MAX_BYTES) renameSync(path, path + ".1");
+  } catch {}
 }
 
 export function audit(hookName, payload = {}) {
   try {
     const path = resolveLogPath();
+    if (!path) return;
     mkdirSync(dirname(path), { recursive: true });
     rotateIfLarge(path);
     const line = JSON.stringify({
@@ -51,7 +45,5 @@ export function audit(hookName, payload = {}) {
       ...payload,
     });
     appendFileSync(path, line + "\n", { encoding: "utf8" });
-  } catch {
-    // Audit is best-effort. Never fail a hook because logging failed.
-  }
+  } catch {}
 }

@@ -1,36 +1,35 @@
 #!/usr/bin/env node
-// PreToolUse hook: Enforce mission AGENTS.md boundary rules on all tool calls,
-// AND inject mission-active status context when the Stop hook was bypassed.
+// PreToolUse hook: enforce mission AGENTS.md boundaries AND inject mission-
+// active context when Stop was bypassed. Also touches the driver heartbeat
+// file so /detach can tell whether this session is actively driving.
 //
-// Two responsibilities (merged from the former autopilot-preloop-guard):
-//
-//   1. HARD BOUNDARIES: reads NEVER-VIOLATE rules from the active mission's
-//      AGENTS.md and blocks tool calls that would violate them (git push,
-//      pkill, writes to protected paths, etc.).
-//
-//   2. SOFT CONTEXT INJECTION: when the mission is active but the tool call
-//      isn't mission-progress-adjacent, injects a system-reminder via
-//      hookSpecificOutput.additionalContext so the assistant sees the current
-//      blocker list even if the Stop hook was bypassed. This is a
-//      defense-in-depth against Anthropic issues #22925, #29881, #8615
-//      (Stop hook fires inconsistently / doesn't block cleanly).
-//
-// Stdin: JSON { tool_name, tool_input, session_id }
-// Stdout: JSON { decision, hookSpecificOutput, ... }
+// v0.5.0: gated on session_id membership in state.attachedSessions[].
 
-import { readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
-import { loadMissionState, checkCompletion } from "./_lib/mission-state.mjs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync, utimesSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { loadAttachedMissionState, checkCompletion, migrateLegacyAttach } from "./_lib/mission-state.mjs";
 import { audit } from "./_lib/audit.mjs";
+import { heartbeatFile, stateBase } from "./_lib/paths.mjs";
+
+function touchHeartbeat(sessionId) {
+  if (!sessionId) return;
+  try {
+    mkdirSync(stateBase(), { recursive: true });
+    const p = heartbeatFile(sessionId);
+    if (existsSync(p)) {
+      const now = new Date();
+      utimesSync(p, now, now);
+    } else {
+      writeFileSync(p, new Date().toISOString());
+    }
+  } catch {}
+}
 
 function loadBoundaries(missionPath) {
   const agentsPath = join(missionPath, "AGENTS.md");
   if (!existsSync(agentsPath)) return { neverRules: [], protectedPaths: [] };
-
   const content = readFileSync(agentsPath, "utf8");
-  const neverRules = [];
-  const protectedPaths = [];
-
+  const neverRules = []; const protectedPaths = [];
   for (const line of content.split("\n")) {
     const trimmed = line.trim();
     if (/never.*git push/i.test(trimmed)) neverRules.push("git_push");
@@ -41,80 +40,57 @@ function loadBoundaries(missionPath) {
       if (pathMatch) protectedPaths.push(pathMatch[1]);
     }
   }
-
   return { neverRules, protectedPaths };
 }
 
 function checkBashCommand(command, boundaries) {
   if (!command) return null;
   const cmd = typeof command === "string" ? command : "";
-
   if (boundaries.neverRules.includes("git_push") && /\bgit\s+push\b/.test(cmd)) {
     return "BLOCKED: git push is forbidden by mission boundaries.";
   }
-
   if (boundaries.neverRules.includes("pkill") && /\bpkill\b/.test(cmd)) {
     return "BLOCKED: pkill is forbidden by mission boundaries. Use targeted kill by PID if needed.";
   }
-
   for (const p of boundaries.protectedPaths) {
     if (cmd.includes(p) && /(rm|mv|>|truncate|dd)/.test(cmd)) {
       return `BLOCKED: ${p} is a protected path. Do not modify or delete it.`;
     }
   }
-
   return null;
 }
 
 function checkFileEdit(filePath, boundaries) {
   if (!filePath) return null;
   for (const p of boundaries.protectedPaths) {
-    if (filePath.includes(p)) {
-      return `BLOCKED: ${filePath} is protected by mission boundaries.`;
-    }
+    if (filePath.includes(p)) return `BLOCKED: ${filePath} is protected by mission boundaries.`;
   }
   return null;
 }
 
-// Rough heuristic: is this tool call making mission progress (running a
-// plugin script, committing, reading state) vs unrelated work? Used only to
-// decide whether to inject a "mission still active" context reminder; never
-// used to block.
 function isMissionProgressTool(tool_name, tool_input) {
   if (tool_name !== "Bash") return false;
   const cmd = (tool_input?.command || "").toString();
   return (
-    /execute-assertion\.mjs|record-assertion\.mjs|mission-lifecycle\.mjs|mission-query\.mjs|sync-features-state\.mjs|reconcile-external-work\.mjs|validate-mission\.mjs|invalidate-stale-evidence\.mjs|critic-evaluator\.mjs|contract-lint\.mjs|write-handoff\.mjs|milestone-seal\.mjs/.test(
-      cmd
-    ) || /\bgit\s+(add|commit|status|log|diff|show)\b/.test(cmd)
+    /execute-assertion\.mjs|record-assertion\.mjs|mission-cli\.mjs|mission-lifecycle\.mjs|mission-query\.mjs|sync-features-state\.mjs|reconcile-external-work\.mjs|validate-mission\.mjs|invalidate-stale-evidence\.mjs|critic-evaluator\.mjs|contract-lint\.mjs|write-handoff\.mjs|milestone-seal\.mjs/.test(cmd)
+    || /\bgit\s+(add|commit|status|log|diff|show)\b/.test(cmd)
   );
 }
 
 function denyPayload(reason) {
   return {
-    decision: "block",
-    message: reason,
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "deny",
-      permissionDecisionReason: reason,
-    },
+    decision: "block", message: reason,
+    hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason },
   };
 }
 
 function allowPayload(additionalContext = null) {
   const out = {
     decision: "allow",
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "allow",
-    },
+    hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
   };
   if (additionalContext) {
     out.hookSpecificOutput.additionalContext = additionalContext;
-    // Belt-and-braces: also emit systemMessage which some Claude Code
-    // versions render as a system-reminder even when additionalContext
-    // doesn't inject (upstream #19643 class of bugs).
     out.systemMessage = additionalContext;
   }
   return out;
@@ -133,42 +109,37 @@ async function main() {
 
   const tool_name = parsed.tool_name;
   const tool_input = parsed.tool_input || {};
-  const cwd = process.env.CLAUDE_WORKING_DIR || process.cwd();
-  const { state } = loadMissionState(cwd);
+  const sessionId = parsed.session_id;
+  const cwd = parsed.cwd || process.env.CLAUDE_WORKING_DIR || process.cwd();
+  const { state, reason } = loadAttachedMissionState({ sessionId, cwd });
 
   if (!state || !state.active || !state.missionPath) {
-    audit("worker-boundary-enforcer", { decision: "allow", tool: tool_name, reason: "no-active-mission" });
+    audit("worker-boundary-enforcer", { decision: "allow", tool: tool_name, reason: reason || "no-active-mission", session_id: sessionId });
     process.stdout.write(JSON.stringify(allowPayload()));
     return;
   }
 
-  // RESPONSIBILITY 1: hard boundaries
+  if (reason === "legacy-auto-attach-pending") {
+    try { await migrateLegacyAttach({ sessionId, cwd }); } catch {}
+  }
+
+  // Driver heartbeat (v0.5.0 §4.3). Touches on PreToolUse AND PostToolUse.
+  touchHeartbeat(sessionId);
+
   const boundaries = loadBoundaries(state.missionPath);
   let blockMsg = null;
-
   if (tool_name === "Bash") {
-    const cmd = tool_input?.command || "";
-    blockMsg = checkBashCommand(cmd, boundaries);
+    blockMsg = checkBashCommand(tool_input?.command || "", boundaries);
   }
-
   if (tool_name === "Edit" || tool_name === "Write") {
-    const fp = tool_input?.file_path || "";
-    blockMsg = checkFileEdit(fp, boundaries);
+    blockMsg = checkFileEdit(tool_input?.file_path || "", boundaries);
   }
-
   if (blockMsg) {
-    audit("worker-boundary-enforcer", {
-      decision: "deny",
-      tool: tool_name,
-      missionPath: state.missionPath,
-      reason: blockMsg,
-    });
+    audit("worker-boundary-enforcer", { decision: "deny", tool: tool_name, missionPath: state.missionPath, reason: blockMsg, session_id: sessionId });
     process.stdout.write(JSON.stringify(denyPayload(blockMsg)));
     return;
   }
 
-  // RESPONSIBILITY 2: soft context injection. Only for non-progress tools,
-  // to avoid redundantly injecting context during mission-progress commands.
   let additionalContext = null;
   if (!isMissionProgressTool(tool_name, tool_input)) {
     const check = checkCompletion(state.missionPath);
@@ -186,12 +157,9 @@ async function main() {
   }
 
   audit("worker-boundary-enforcer", {
-    decision: "allow",
-    tool: tool_name,
-    missionPath: state.missionPath,
-    injectedContext: additionalContext ? true : false,
+    decision: "allow", tool: tool_name, missionPath: state.missionPath,
+    injectedContext: !!additionalContext, session_id: sessionId,
   });
-
   process.stdout.write(JSON.stringify(allowPayload(additionalContext)));
 }
 

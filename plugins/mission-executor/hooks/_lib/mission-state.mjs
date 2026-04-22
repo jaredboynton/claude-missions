@@ -1,52 +1,24 @@
-// Shared mission-state + completion-check helpers used by every hook.
+// Hook-side mission-state loader and completion-gate helpers.
 //
-// Previously, autopilot-lock.mjs reimplemented checkCompletion inline. That
-// worked but meant completion logic drift whenever a hook needed to know
-// "is the mission currently blocking on X?". This module is the single
-// source of truth.
+// v0.5.0 rewrite:
+//   - loadMissionState (walk-up, cwd-based) -> DELETED.
+//     loadMissionStateFromCwd (rename, no walk-up) kept for scripts only.
+//   - loadAttachedMissionState({ sessionId, cwd }) -> NEW primary API for hooks.
+//     Gates enforcement on membership in state.attachedSessions[].
+//   - Legacy-migration fallback for pre-0.5.0 state files (critic C2/N3):
+//     emits reason: "legacy-auto-attach-pending" so hooks fire AND trigger
+//     one-shot migration under stateLockFile().
+//   - walkUpForState / walkUpForAbort -> DELETED.
 
-import { readFileSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
+import {
+  stateFile, stateLockFile, abortFile, registryFile,
+} from "./paths.mjs";
+import { findMissionForSession } from "./registry.mjs";
 
-const STATE_REL = ".omc/state/mission-executor-state.json";
-const ABORT_REL = ".omc/state/mission-executor-abort";
+// ---- Completion criteria (unchanged from 0.4.x except path imports) ----
 
-export function walkUpForState(start) {
-  let cur = start;
-  for (let i = 0; i < 8; i++) {
-    const p = join(cur, STATE_REL);
-    if (existsSync(p)) return p;
-    const parent = dirname(cur);
-    if (parent === cur) break;
-    cur = parent;
-  }
-  return null;
-}
-
-export function walkUpForAbort(start) {
-  let cur = start;
-  for (let i = 0; i < 8; i++) {
-    const p = join(cur, ABORT_REL);
-    if (existsSync(p)) return p;
-    const parent = dirname(cur);
-    if (parent === cur) break;
-    cur = parent;
-  }
-  return null;
-}
-
-export function loadMissionState(cwd) {
-  const statePath = walkUpForState(cwd);
-  if (!statePath) return { state: null, statePath: null };
-  try {
-    return { state: JSON.parse(readFileSync(statePath, "utf8")), statePath };
-  } catch {
-    return { state: null, statePath };
-  }
-}
-
-// Evaluate mission completion criteria. Returns { complete: bool, reason?: string,
-// detail?: { counts, failedIds, staleIds, proofLessIds, pendingFeatures } }.
 export function checkCompletion(missionPath) {
   try {
     const vsPath = join(missionPath, "validation-state.json");
@@ -63,19 +35,13 @@ export function checkCompletion(missionPath) {
 
     const assertions = vs.assertions || {};
     const counts = { total: 0, passed: 0, failed: 0, stale: 0, pending: 0, proofLess: 0 };
-    const failedIds = [];
-    const staleIds = [];
-    const proofLessIds = [];
+    const failedIds = []; const staleIds = []; const proofLessIds = [];
     for (const [id, a] of Object.entries(assertions)) {
       counts.total++;
       const status = a.status || "pending";
       if (status === "passed") {
-        if (!a.proof || !a.proof.commitSha) {
-          counts.proofLess++;
-          proofLessIds.push(id);
-        } else {
-          counts.passed++;
-        }
+        if (!a.proof || !a.proof.commitSha) { counts.proofLess++; proofLessIds.push(id); }
+        else counts.passed++;
       } else if (status === "failed") { counts.failed++; failedIds.push(id); }
       else if (status === "stale") { counts.stale++; staleIds.push(id); }
       else counts.pending++;
@@ -85,40 +51,38 @@ export function checkCompletion(missionPath) {
     const pendingFeatures = features.filter((f) => f.status !== "completed");
 
     const reasons = [];
-    if (counts.failed > 0) reasons.push(`${counts.failed} failed assertion(s): ${failedIds.slice(0, 3).join(", ")}${failedIds.length > 3 ? "..." : ""}`);
-    if (counts.stale > 0) reasons.push(`${counts.stale} stale assertion(s) need re-run: ${staleIds.slice(0, 3).join(", ")}${staleIds.length > 3 ? "..." : ""}`);
+    if (counts.failed > 0) reasons.push(`${counts.failed} failed assertion(s): ${failedIds.slice(0,3).join(", ")}${failedIds.length>3?"...":""}`);
+    if (counts.stale > 0) reasons.push(`${counts.stale} stale assertion(s) need re-run: ${staleIds.slice(0,3).join(", ")}${staleIds.length>3?"...":""}`);
     if (counts.pending > 0) reasons.push(`${counts.pending} pending assertion(s)`);
-    if (counts.proofLess > 0) reasons.push(`${counts.proofLess} passed-without-proof assertion(s): ${proofLessIds.slice(0, 3).join(", ")}${proofLessIds.length > 3 ? "..." : ""}`);
-    if (pendingFeatures.length > 0) reasons.push(`${pendingFeatures.length} feature(s) not completed: ${pendingFeatures.slice(0, 3).map((f) => f.id).join(", ")}${pendingFeatures.length > 3 ? "..." : ""}`);
+    if (counts.proofLess > 0) reasons.push(`${counts.proofLess} passed-without-proof assertion(s): ${proofLessIds.slice(0,3).join(", ")}${proofLessIds.length>3?"...":""}`);
+    if (pendingFeatures.length > 0) reasons.push(`${pendingFeatures.length} feature(s) not completed: ${pendingFeatures.slice(0,3).map((f)=>f.id).join(", ")}${pendingFeatures.length>3?"...":""}`);
     if (st.state !== "completed") reasons.push(`mission state.json is '${st.state}', not 'completed'`);
 
     if (reasons.length === 0) return { complete: true };
     return {
       complete: false,
       reason: reasons.join("; "),
-      detail: { counts, failedIds, staleIds, proofLessIds, pendingFeatures: pendingFeatures.map((f) => f.id) },
+      detail: { counts, failedIds, staleIds, proofLessIds, pendingFeatures: pendingFeatures.map((f)=>f.id) },
     };
   } catch (e) {
     return { complete: false, reason: `completion check failed: ${e.message}` };
   }
 }
 
-// Suggest the next concrete command the orchestrator should run, given current
-// mission state. Used in PreToolUse/deny reasons so the block message actually
-// tells Claude what to do.
+// ---- Next-action suggestion (v0.5.0: points at mission-cli.mjs) ----
+
 export function suggestNextAction(missionPath, pluginRoot) {
   const check = checkCompletion(missionPath);
   if (check.complete) {
     return [
-      `node ${pluginRoot}/scripts/mission-lifecycle.mjs complete`,
+      `node ${pluginRoot}/scripts/mission-cli.mjs complete --session-id=<sid>`,
       "# (all gates clear; mark mission complete)",
     ].join("\n");
   }
   const d = check.detail || {};
-  // Priority: failed assertions -> stale -> pending -> proofless -> features -> state.json
   if ((d.failedIds || []).length > 0) {
     return [
-      `# ${d.failedIds.length} failed assertion(s). Fix the underlying code, commit, then re-run:`,
+      `# ${d.failedIds.length} failed assertion(s). Fix code, commit, then re-run:`,
       ...d.failedIds.slice(0, 3).map(
         (id) => `MISSION_EXECUTOR_WRITER=1 node ${pluginRoot}/scripts/execute-assertion.mjs <mission> --id=${id}`
       ),
@@ -136,8 +100,7 @@ export function suggestNextAction(missionPath, pluginRoot) {
   const counts = d.counts || {};
   if (counts.pending > 0) {
     return [
-      `# ${counts.pending} pending assertion(s). Execute the next one:`,
-      `# (use mission-query.mjs to list all pending ids)`,
+      `# ${counts.pending} pending assertion(s). Execute next:`,
       `node ${pluginRoot}/scripts/mission-query.mjs <mission> assertions | jq -r '.pendingIds[0]'`,
       `MISSION_EXECUTOR_WRITER=1 node ${pluginRoot}/scripts/execute-assertion.mjs <mission> --id=<id>`,
     ].join("\n");
@@ -153,12 +116,146 @@ export function suggestNextAction(missionPath, pluginRoot) {
   }
   if ((d.pendingFeatures || []).length > 0) {
     return [
-      `# ${d.pendingFeatures.length} feature(s) not marked completed. Reconcile from commits/proofs:`,
+      `# ${d.pendingFeatures.length} feature(s) not marked completed. Reconcile:`,
       `node ${pluginRoot}/scripts/reconcile-external-work.mjs <mission> --apply`,
     ].join("\n");
   }
   return [
     `# state.json is not 'completed'. Run completion gate:`,
-    `node ${pluginRoot}/scripts/mission-lifecycle.mjs complete`,
+    `node ${pluginRoot}/scripts/mission-cli.mjs complete --session-id=<sid>`,
   ].join("\n");
+}
+
+// ---- Abort flag: scoped to the current project's stateBase (no walk-up) ----
+
+export function readAbortFlag() {
+  const p = abortFile();
+  if (!existsSync(p)) return null;
+  return p;
+}
+
+export function clearAbortFlag() {
+  const p = abortFile();
+  try { unlinkSync(p); } catch {}
+}
+
+// ---- Primary v0.5.0 loader for hooks ----
+
+// Returns one of:
+//   { state, statePath }                                         -> session attached, enforce normally
+//   { state: null, statePath: null, reason: "no-session-id" }    -> hook must no-op
+//   { state: null, statePath: null, reason: "not-attached" }     -> hook must no-op (invisible)
+//   { state: null, statePath, reason: "inactive" }               -> mission not active
+//   { state, statePath, reason: "legacy-auto-attach-pending" }   -> enforce AND migrate
+//
+// Resolution order:
+//   1. Registry lookup (cross-project; fast path for a session that ran /execute)
+//   2. Project-local state file where sessionId is already in attachedSessions[]
+//   3. Project-local state file is active AND mission is NOT in the registry:
+//      treat as legacy-auto-attach-pending regardless of whether attachedSessions
+//      is empty. The registry entry is the "formally registered" signal; absent
+//      it, ANY session arriving should auto-attach via migrateLegacyAttach().
+//      This is the v5 fix for the concurrent-migration race where Hook A
+//      migrates to [A] before Hook B reads state, leaving B unable to attach.
+export function loadAttachedMissionState({ sessionId, cwd } = {}) {
+  if (!sessionId) return { state: null, statePath: null, reason: "no-session-id" };
+
+  // 1. Registry lookup
+  const found = findMissionForSession(sessionId);
+  if (found) {
+    const s = found.state;
+    if (!s.active) return { state: null, statePath: found.entry.statePath, reason: "inactive" };
+    return { state: s, statePath: found.entry.statePath };
+  }
+
+  // 2. & 3. Project-local state file
+  try {
+    const localPath = stateFile();
+    if (existsSync(localPath)) {
+      const s = JSON.parse(readFileSync(localPath, "utf8"));
+      if (s.active) {
+        if (s.attachedSessions?.some((x) => x.sessionId === sessionId)) {
+          return { state: s, statePath: localPath };
+        }
+        // Mission active but this session isn't in it. If the mission is also
+        // NOT registered in the global registry, this is a legacy-migration
+        // candidate — auto-attach this session via migrateLegacyAttach.
+        const registered = isRegistered(s.missionId, s.missionPath);
+        if (!registered) {
+          return { state: s, statePath: localPath, reason: "legacy-auto-attach-pending" };
+        }
+      }
+    }
+  } catch {}
+
+  return { state: null, statePath: null, reason: "not-attached" };
+}
+
+function isRegistered(missionId, missionPath) {
+  try {
+    const p = registryFile();
+    if (!existsSync(p)) return false;
+    const doc = JSON.parse(readFileSync(p, "utf8"));
+    if (!doc?.missions) return false;
+    if (missionId && doc.missions[missionId]) return true;
+    if (!missionPath) return false;
+    for (const entry of Object.values(doc.missions)) {
+      if (!entry?.statePath) continue;
+      try {
+        const ms = JSON.parse(readFileSync(entry.statePath, "utf8"));
+        if (ms.missionPath === missionPath) return true;
+      } catch {}
+    }
+  } catch {}
+  return false;
+}
+
+// ---- One-shot legacy migration, append-if-absent under stateLockFile ----
+//
+// Called by any hook that sees reason: "legacy-auto-attach-pending". Acquires
+// the state-file lock with a short deadline (if another hook is already mid-
+// migration, we just skip — they'll finish and the next call for this session
+// will hit the primary path). Append-if-absent semantics mean concurrent
+// migrations with distinct session-ids all land in attachedSessions[].
+//
+// Returns: { migrated: bool, skipped: bool, reason? }
+export async function migrateLegacyAttach({ sessionId, cwd } = {}) {
+  if (!sessionId) return { migrated: false, skipped: true, reason: "no-session-id" };
+  const { withLock } = await import("../../scripts/_lib/lockfile.mjs");
+  const p = stateFile();
+  try {
+    return await withLock(stateLockFile(), () => {
+      if (!existsSync(p)) return { migrated: false, skipped: true, reason: "no-state" };
+      const s = JSON.parse(readFileSync(p, "utf8"));
+      s.attachedSessions = s.attachedSessions || [];
+      if (s.attachedSessions.some((x) => x.sessionId === sessionId)) {
+        return { migrated: false, skipped: true, reason: "already-attached" };
+      }
+      s.attachedSessions.push({
+        sessionId,
+        attachedAt: new Date().toISOString(),
+        cwd: cwd || process.cwd(),
+        role: "driver",
+        migratedFromLegacy: true,
+      });
+      s.updatedAt = new Date().toISOString();
+      const tmp = p + ".tmp";
+      mkdirSync(dirname(p), { recursive: true });
+      writeFileSync(tmp, JSON.stringify(s, null, 2) + "\n");
+      renameSync(tmp, p);
+      return { migrated: true, skipped: false };
+    }, { deadlineMs: 1000 });
+  } catch (e) {
+    if (e.code === "LOCK_TIMEOUT") return { migrated: false, skipped: true, reason: "lock-timeout" };
+    return { migrated: false, skipped: true, reason: `error:${e.message}` };
+  }
+}
+
+// ---- Script-side back-compat loader (no walk-up; reads project-local state) ----
+
+export function loadMissionStateFromCwd() {
+  const p = stateFile();
+  if (!existsSync(p)) return { state: null, statePath: null };
+  try { return { state: JSON.parse(readFileSync(p, "utf8")), statePath: p }; }
+  catch { return { state: null, statePath: p }; }
 }
