@@ -79,6 +79,17 @@
           }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start-record.mjs\"",
+            "timeout": 3
+          }
+        ]
+      }
     ]
   }
 }
