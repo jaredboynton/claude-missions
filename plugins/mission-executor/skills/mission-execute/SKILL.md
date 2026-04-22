@@ -58,6 +58,22 @@ Escape hatch: the user may create `<working-dir>/.omc/state/mission-executor-abo
 decision. Use this to diagnose whether hooks loaded and fired when a
 mission post-mortem claims enforcement was bypassed.
 
+If the audit log is missing or empty for a session that definitely ran
+tool calls, the hooks were never registered -- DON'T assume Stop-hook
+flakiness. Confirm by inspecting Claude Code's own session transcript:
+
+```bash
+rg -oN '"hookInfos":\[[^\]]+\]' \
+  ~/.claude/projects/<cwd-encoded>/<session-id>.jsonl \
+  | rg 'autopilot-lock|no-ask-during-mission|worker-boundary-enforcer'
+```
+
+If that prints nothing, Claude Code didn't see our hooks in the
+registered set -- most likely because `hooks.json` was moved to a
+non-discovered location. Run `node scripts/selfcheck-hooks.mjs` in
+the plugin directory to verify the registration paths before blaming
+upstream Stop-hook bugs.
+
 ## Known Stop-hook limitations (Anthropic upstream)
 
 Stop hooks are flaky in Claude Code and cannot be trusted as the only

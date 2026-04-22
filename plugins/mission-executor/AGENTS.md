@@ -68,9 +68,22 @@ the installed version.
   enforcement as well.
 - Every hook logs to `<wd>/.omc/state/hook-audit.log` via
   `hooks/_lib/audit.mjs`. First diagnostic when enforcement appears to
-  be bypassed: `tail .omc/state/hook-audit.log` to verify the hook fired
-  at all. If it didn't, check plugin enablement and Claude Code version
-  compatibility with the `hookSpecificOutput.permissionDecision` schema.
+  be bypassed: compare session tool calls against `hookInfos` entries in
+  `~/.claude/projects/<cwd-encoded>/<session-id>.jsonl`. That is Claude
+  Code's own record of which hook commands it dispatched for each event.
+  If mission-executor hooks are absent from `hookInfos` (or the `command`
+  field inside them doesn't mention our `.mjs` files), Claude Code never
+  registered them. `hook-audit.log` is only written when hooks actually
+  run, so an empty log could mean either "hook ran but audit failed" or
+  "hook never registered"; `hookInfos` disambiguates.
+- **Hook registration**: `hooks/hooks.json` lives at the plugin root, NOT
+  in `.claude-plugin/`. Claude Code's auto-discovery only scans
+  `hooks/hooks.json`; `.claude-plugin/hooks.json` is silently ignored
+  (0.4.5 shipped that way and every mission ran with zero enforcement).
+  We also set `"hooks": "./hooks/hooks.json"` in `plugin.json` as a
+  belt-and-braces explicit declaration. Run
+  `node scripts/selfcheck-hooks.mjs` before any release to catch
+  discovery-path regressions.
 - `write-handoff.mjs` is a STUB. Worker-return contract (workers writing
   `.omc/handoffs-inbox/<worker-id>.json` before shutdown) isn't implemented;
   under `--force` the script writes an advisory handoff marked `_unverified`.
