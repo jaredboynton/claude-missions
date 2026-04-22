@@ -11,6 +11,13 @@ triggers:
 
 Quick status check for a Factory mission. Shows feature completion, assertion pass rates, and current phase.
 
+**v0.5.0**: prefer `/mission-executor:status` (read-only slash command, runs
+`mission-cli.mjs status` and prints a single JSON object) over invoking this
+skill for routine status checks. This skill remains useful for producing the
+human-readable report format below via `mission-query.mjs`, but for just
+"what phase is the mission in / who is attached / is it complete?" the
+slash command is faster and doesn't require skill-invocation context.
+
 ## Input
 
 - `<mission-path>`: Path to `.factory/missions/<id>/` directory. Auto-discovers if omitted.

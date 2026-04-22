@@ -11,6 +11,24 @@ triggers:
 
 # Mission Executor (Claude Code lane)
 
+## Precondition (v0.5.0)
+
+**This skill must be invoked via `/mission-executor:execute <mission-path-or-id>`.**
+The slash command is the canonical entry point; it registers this session in
+the mission's `attachedSessions[]` so hooks enforce correctly. If you reached
+this skill directly (without the command firing first), abort and tell the
+user to run the command instead — hooks will no-op for unattached sessions
+and enforcement will silently not fire.
+
+To verify attachment from within the skill:
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/mission-cli.mjs" is-attached --session-id="<sid>"
+```
+Exit 0 = attached (continue). Exit 1 = not attached (abort with an error
+message directing the user to run `/mission-executor:execute <mission-path>`).
+
+## Overview
+
 Executes Factory/droid missions FROM CLAUDE CODE. This is the Claude-Code side
 of a dual-runtime system. The Factory droid CLI runtime owns the
 feature→worker→handoff→dismiss loop, scrutiny-validator auto-injection at
@@ -51,7 +69,7 @@ The mission is complete only when:
 - every feature in `features.json` is `status=completed`, and
 - `state.json` has `state=completed`.
 
-Escape hatch: the user may create `<working-dir>/.omc/state/mission-executor-abort` to release the lock mid-run.
+Escape hatch: the user runs `/mission-executor:abort` to release the lock mid-run (or manually creates the abort marker at `<layoutRoot>/state/mission-executor-abort`; path resolved by `hooks/_lib/paths.mjs`).
 
 **Audit log**: every hook invocation appends to
 `<working-dir>/.omc/state/hook-audit.log` with timestamp, hook name, and
@@ -96,13 +114,22 @@ injection uses both `hookSpecificOutput.additionalContext` AND top-level
 
 ## Lifecycle state
 
-Before Phase 0 runs, the skill MUST register mission state so the Stop hook can enforce completion:
+**v0.5.0 change**: `/mission-executor:execute` already registered the mission
+and attached this session BEFORE the skill was invoked. Do NOT call
+`mission-lifecycle.mjs start` or `mission-cli.mjs start` again — that work is
+done. The state file (`stateBase()/mission-executor-state.json`) is already
+written with `active=true` and this session is already in `attachedSessions[]`.
 
+The Stop hook reads that state file and refuses to let the assistant end its
+turn until completion criteria are met. If `is-attached` returns exit 1 at
+any point during the pipeline, something removed this session from the
+mission's scope — abort with a clear error.
+
+Phase transitions: as the pipeline advances phase, record the transition:
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/mission-lifecycle.mjs" start "$MISSION_PATH"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/mission-cli.mjs" phase "3-execute" --session-id="<sid>"
 ```
-
-This writes `<working-dir>/.omc/state/mission-executor-state.json` with `active=true`. The Stop hook reads that file and refuses to let the assistant end its turn until completion criteria are met.
+`mission-lifecycle.mjs phase` also works (thin delegator; same contract).
 
 At each phase transition, update the phase label so operator logs track progress:
 
@@ -274,12 +301,19 @@ for the whole mission.
 
 #### Tier selection (inspection-first, smoke-probe on Tier 2)
 
+**v0.5.0 reorder (spec §7.2)**: native `Agent()` is now Tier 1 (always
+available, zero deps). OMC `/team` is Tier 3 when detected — still
+preferred for high-parallelism batches when OMC is installed (its
+pane-management + cancel plumbing win over native Task in practice) but
+no longer the default. The plugin is genuinely usable without OMC.
+
 Evaluate in order and use the first match:
 
-1. **Tier 1 — OMC `/team`**: if `oh-my-claudecode:team` appears in the
-   session's available-skills list (in the system-reminder at session
-   start).
-2. **Tier 2 — Native Claude Code Agent Teams**: else, if `TeamCreate`,
+1. **Tier 1 — Sequential `Agent()`** (always available): baseline dispatch
+   path. Zero dependencies, no experimental flags, works in every Claude
+   Code install. For small batches (≤2 features) or missions where
+   parallelism gains are marginal, stop here.
+2. **Tier 2 — Native Claude Code Agent Teams** (parallel): if `TeamCreate`,
    `SendMessage`, AND `Agent` (with a `team_name` parameter) all appear
    in the session's tool catalog. This signals that
    `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` is set in settings.json
@@ -289,8 +323,11 @@ Evaluate in order and use the first match:
    with `team_name` actually succeeds (see caveat #40270 below). Tier 2
    selection MUST include a throwaway smoke-probe before committing the
    mission to this tier; see the "Mandatory preflight probe" subsection.
-3. **Tier 3 — Sequential `Agent()` fallback**: else, or whenever Tier 2
-   probe fails.
+3. **Tier 3 — OMC `/team`** (optional, if detected): if
+   `oh-my-claudecode:team` appears in the session's available-skills
+   list AND the mission has ≥3 parallel features where OMC's stage
+   pipeline / handoff docs / worktree isolation add real value. Skip
+   silently if OMC isn't installed.
 
 Step 1 and 2 detection are inspection-only — grep the session's
 system-reminder text for the literal skill name and tool names. Do not
@@ -306,7 +343,7 @@ hand-rolled `Agent()` call fails. Abort Phase 3 with an explicit error
 instructing the operator to re-run from plain `claude` (not
 `claude --agent`).
 
-#### Tier 1 — `/oh-my-claudecode:team` (when available)
+#### Tier 3 — `/oh-my-claudecode:team` (when detected)
 
 If OMC's `/team` skill is loaded, dispatch the batch through it. The
 skill layers stage-aware agent routing, handoff documents, state-file
@@ -336,7 +373,7 @@ Benefits beyond raw primitives: interoperates cleanly with
 surfaces standard OMC state files (`state_read mode=team`) for operator
 visibility.
 
-#### Tier 2 — Native Agent Teams (experimental; use only if OMC is unavailable AND `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` is already set in the host profile)
+#### Tier 2 — Native Agent Teams (experimental parallel; requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in the host profile)
 
 If OMC isn't installed but native teams are enabled, the orchestrator
 MAY hand-roll the team primitives directly — subject to the caveats
@@ -397,7 +434,7 @@ Shutdown workers via SendMessage(shutdown_request) -> await
 shutdown_response -> TeamDelete.
 ```
 
-#### Tier 3 — Sequential `Agent()` fallback
+#### Tier 1 — Sequential `Agent()` (baseline; always available)
 
 If neither Tier 1 nor Tier 2 is available (or Tier 2 preflight probe
 failed), dispatch features through pure `Agent()` subagents with

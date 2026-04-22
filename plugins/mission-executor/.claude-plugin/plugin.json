@@ -7,6 +7,5 @@
   },
   "homepage": "https://github.com/jaredboynton/claude-missions",
   "license": "MIT",
-  "keywords": ["factory", "droid", "mission", "autopilot", "teams", "validation"],
-  "hooks": "./hooks/hooks.json"
+  "keywords": ["factory", "droid", "mission", "autopilot", "teams", "validation"]
 }

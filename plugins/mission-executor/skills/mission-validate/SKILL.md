@@ -27,7 +27,10 @@ Standalone validation pass -- runs all assertions from validation-contract.md ag
    - `cli-binary`: CLI invocations, check exit codes + output
    - `tuistory`: TUI snapshot captures, check content patterns
 5. **Update** validation-state.json with results
-6. **Write** evidence files to .omc/validation/
+6. **Write** evidence files to the plugin's validation dir (resolved by
+   `hooks/_lib/paths.mjs` — `validationDir()` returns
+   `<layoutRoot>/validation`, which is `.mission-executor/validation/` by
+   default, or `.omc/validation/` for legacy-autodetected installs)
 7. **Report** summary: N pass, N fail, N pending
 
 ## Options
