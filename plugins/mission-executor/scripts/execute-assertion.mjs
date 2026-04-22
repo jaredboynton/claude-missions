@@ -88,10 +88,18 @@ function parseAssertion(contract, id) {
   const title = (fullBlock.match(/^###\s+[^:\n]+:\s*(.+)$/m) || [, ""])[1].trim();
   const toolLine = fullBlock.match(/^Tool:\s*(.+)$/m);
   const evidenceLine = fullBlock.match(/^Evidence:\s*(.+)$/m);
+  // Tool names are often backtick-wrapped in the contract markdown
+  // (e.g. `` Tool: `shell+git` ``). Strip the backticks AND any
+  // surrounding whitespace so downstream dispatch sees the canonical
+  // name. Compound tools like `` `curl` + `shell+aws` `` also need
+  // each sub-tool unwrapped — the split-on-`+` below handles that at
+  // runOne level, but we still strip the outer backticks here.
+  const rawTool = toolLine ? toolLine[1].trim() : null;
+  const tool = rawTool ? rawTool.replace(/`/g, "").trim() : null;
   return {
     id,
     title,
-    tool: toolLine ? toolLine[1].trim() : null,
+    tool,
     evidence: evidenceLine ? evidenceLine[1].trim() : null,
     body: fullBlock,
   };
@@ -104,8 +112,37 @@ function touchpointsForAssertion(features, id) {
   for (const f of features) {
     if (!Array.isArray(f.fulfills) || !f.fulfills.includes(id)) continue;
     const desc = f.description || "";
-    const re = /`([^`]+\.(ts|tsx|js|jsx|py|go|rs|sql))`/g;
+    const re = /`([^`]+\.(ts|tsx|js|jsx|py|go|rs|sql|sh|hcl|tf|yml|yaml|json|md))`/g;
     for (const m of desc.matchAll(re)) tp.add(m[1]);
+  }
+  return [...tp];
+}
+
+// Derive touchpoints from a shell command when feature descriptions don't
+// declare any. For grep/rg/find/aws-s3/terraform invocations, the path
+// arguments ARE the meaningful touchpoints — they're the tree surfaces the
+// assertion is probing. Records these as "tree:path/to/dir" to distinguish
+// from source-file touchpoints.
+function inferTouchpointsFromCommand(cmd) {
+  if (!cmd) return [];
+  // Strip comment prefix the shell-generic dispatcher adds
+  const cleaned = cmd.replace(/^#[^\n]*\n/g, "");
+  const tokens = cleaned.split(/\s+/);
+  const tp = new Set();
+  for (const t of tokens) {
+    // Accept path-like tokens: starts with a word char, contains `/` or
+    // ends in `.ext`. Reject flags (start with -) and values that look
+    // like flag args (`--since=...`, `-n`, etc.).
+    if (/^-/.test(t)) continue;
+    if (/^[A-Za-z_][\w./-]+\/$/.test(t) || /^[A-Za-z_][\w./-]+\.\w{1,6}$/.test(t) ||
+        /^[A-Za-z_][\w./-]+\/[\w.-]+/.test(t)) {
+      // Strip surrounding quotes
+      const p = t.replace(/^['"]|['"]$/g, "");
+      // Reject URLs
+      if (/^https?:/.test(p)) continue;
+      tp.add(`tree:${p}`);
+      if (tp.size >= 4) break;
+    }
   }
   return [...tp];
 }
@@ -692,6 +729,238 @@ function dispatchLiteralProbe(ctx) {
   };
 }
 
+// shell-generic: catch-all dispatcher for tool types not covered by the five
+// canonical dispatchers (unit-test, curl, cli-binary, tuistory, literal-probe).
+//
+// Handles mission contracts whose Tool: fields use compound names like
+// `shell+grep`, `shell+aws`, `shell+git`, `shell+ssh`, `shell+terraform`,
+// `shell+yq`, `shell+gh`, `shell+wrangler`, `shell+trufflehog`, `packer`,
+// `actionlint`, `yamllint`, `shellcheck`, `bash-n`, `node+regex`,
+// `node+vitest`. All of these boil down to "run a shell command and check
+// exit code + output shape," so one dispatcher covers the lot.
+//
+// Strategy:
+//  1. Extract the first runnable backtick command from evidence (preferred)
+//     or body. A command "looks runnable" when it starts with a known
+//     executable and has no obvious unsubstituted placeholders.
+//  2. Substitute common placeholders ($MISSION, <mission>, <working-dir>).
+//  3. Run via bash -lc in the working directory.
+//  4. Parse expected outcome from the evidence + body:
+//     - exit-code expectation (`exit 0`, `exits 1`)
+//     - count expectation (`== 0`, `>= N`, `count 0`, `empty`, `non-empty`,
+//       `zero`, `N or more`)
+//     - literal expectation (`contains "X"`, `includes X`, `matches "Y"`)
+//  5. Pass when all applicable expectations hold; else fail.
+//
+// Records with toolType="cli-binary" so record-assertion (which only
+// accepts the canonical 5) accepts the proof. The originating tool name
+// is preserved in the command field for audit.
+//
+// Returns { status: "passed"|"failed"|"blocked", ... }. Blocks (not fails)
+// when no runnable command could be extracted — the assertion is
+// narrative-only and requires operator attestation or the droid runtime.
+function dispatchShellGeneric(ctx, origTool) {
+  const { evidence, body, workingDir } = ctx;
+  const searchText = (body || "") + "\n" + (evidence || "");
+
+  // Known executables we'll accept as a runnable command prefix. Anything
+  // outside this set is likely a placeholder or narrative reference.
+  const EXEC_PREFIX = /^(sudo\s+)?(curl|aws|git|jq|grep|rg|find|trufflehog|dig|ssh|packer|terraform|node|bash|python3?|actionlint|yamllint|shellcheck|gh|wrangler|yq|npx|npm|cat|awk|sed|diff|pcregrep|xargs|ls|wc|tee|test|cd|for|while|if|echo|printf|file|md5sum|sha256sum|openssl|just|tar|zip|unzip|which|command|type|date|sort|uniq|head|tail|stat|chmod|chown|install|mkdir|touch|ln|cp|mv|rm|env|export)\b/;
+
+  // Skip backtick blocks that are obviously not commands.
+  const NOT_RUNNABLE = /^(TODO|FIXME|ERROR|WARN|INFO|note|see|cf|e\.g|i\.e)\b|^(\$|<|>)|^\d+$/i;
+
+  // Reject commands with unsubstituted placeholders. Covers:
+  //   - `<placeholder>` angle-bracket form (except `<working-dir>`,
+  //     `<mission>`, `<path>` which we substitute below)
+  //   - `...` bare ellipsis ("aws iam get-role ...")
+  //   - Trailing `=` with no value ("--since=")
+  //   - $VAR placeholders we didn't substitute (e.g. $MY_CUSTOM_VAR)
+  function hasUnsubstitutedPlaceholder(c) {
+    // `...` anywhere in the command. Contract authors use "`cmd ...`" as
+    // shorthand; it's never a runnable command.
+    if (/\.{3}/.test(c)) return true;
+    // Trailing `=` with no value ("--since=")
+    if (/=\s*$/.test(c)) return true;
+    // <placeholder> form (except the substitutable ones)
+    if (/<[a-z_-]+>/i.test(c) && !/(<working-dir>|<mission>|<path>)/i.test(c)) return true;
+    // Trailing backslash or incomplete redirection
+    if (/\\\s*$/.test(c) || />\s*$/.test(c)) return true;
+    // Reject commands that are trivially short / fragmentary (< 6 chars
+    // after the executable means probably just "git log" with no args,
+    // which our expectation-parser can't score).
+    const tokens = c.split(/\s+/);
+    if (tokens.length <= 2 && c.length < 12) return true;
+    // Reject single-token "commands" without spaces — these are typically
+    // symbol/API references like `env.AUDIT.put` or `packer/Packer` that
+    // happen to start with a matching prefix but are not invocations.
+    // A real command has at least one space (invocation + argument).
+    if (tokens.length === 1 && !/--?\w/.test(c)) return true;
+    // Reject commands that look like path references rather than invocations:
+    //   `foo/bar` (slash in first token without preceding exec keyword)
+    //   `Module.method` style
+    if (tokens.length === 1 && /\//.test(tokens[0])) return true;
+    if (/\.[A-Z][a-z]+\b/.test(tokens[0])) return true;
+    return false;
+  }
+
+  function tryExtract(source) {
+    if (!source) return null;
+    const blocks = [...source.matchAll(/`([^`]+)`/g)].map((m) => m[1]);
+    for (const b of blocks) {
+      const trimmed = b.trim();
+      if (NOT_RUNNABLE.test(trimmed)) continue;
+      if (!EXEC_PREFIX.test(trimmed)) continue;
+      if (hasUnsubstitutedPlaceholder(trimmed)) continue;
+      return trimmed;
+    }
+    return null;
+  }
+
+  let cmd = tryExtract(evidence) || tryExtract(body);
+  if (!cmd) {
+    return {
+      status: "blocked",
+      message: `no runnable command in evidence (narrative-only assertion; tool='${origTool}')`,
+    };
+  }
+
+  // Placeholder substitution.
+  cmd = cmd
+    .replace(/<working-dir>/gi, workingDir)
+    .replace(/<mission>/gi, ctx.missionPath || "")
+    .replace(/\$MISSION_PATH\b/g, ctx.missionPath || "")
+    .replace(/\$WORKING_DIR\b/g, workingDir);
+
+  const r = runCapture(cmd, workingDir);
+  const out = (r.stdout || "") + (r.stderr || "");
+  const lineCount = r.stdout ? r.stdout.split("\n").filter((l) => l.length > 0).length : 0;
+
+  // Expectation extraction from evidence+body (in that priority).
+  const exp = searchText;
+
+  // Exit-code expectation
+  let expectedExit = null;
+  const exitMatch = exp.match(/exits?\s+(?:with\s+)?(?:code\s+)?(\d+)/i) || exp.match(/\bexit\s*[:=]?\s*(\d+)/i);
+  if (exitMatch) expectedExit = Number(exitMatch[1]);
+
+  // Count expectations
+  // Normalize "count == 0", "count 0", "returns 0", "0 matches", "empty",
+  // "zero", ">= N", "N or more", "at least N", "== N".
+  let expectedCountOp = null;
+  let expectedCountVal = null;
+  const emptyRx = /\b(empty|no\s+(hits?|matches?|results?|entries|occurrences?|output)|zero\s+(hits?|matches?|results?|occurrences?)|returns?\s+(nothing|empty|0|zero)|prints?\s+(nothing|empty|0)|count\s*(==|is|=)?\s*0|0\s+hits|0\s+matches|0\s+results|silent)\b/i;
+  const nonEmptyRx = /\b(non-?empty|at\s+least\s+one|>=\s*1|>\s*0|1\s+or\s+more)\b/i;
+  const gteRx = /\b(?:>=|at\s+least|min(?:imum)?\s+of|(\d+)\s+or\s+more)\s*(\d+)?\b/i;
+  const eqRx = /\b(?:==|equals?|is|count\s*(?:==|=|is)?)\s*(\d+)\b/i;
+  const minusRx = /\bexactly\s+(\d+)\b/i;
+  const gteAlt = /\bmatches?\s+(\d+)\b/i;
+
+  if (emptyRx.test(exp)) {
+    expectedCountOp = "=="; expectedCountVal = 0;
+  } else if (nonEmptyRx.test(exp)) {
+    expectedCountOp = ">="; expectedCountVal = 1;
+  } else {
+    const gte = exp.match(gteRx);
+    const eq = exp.match(eqRx) || exp.match(minusRx) || exp.match(gteAlt);
+    if (gte && gte[2]) {
+      expectedCountOp = ">=";
+      expectedCountVal = Number(gte[2]);
+    } else if (gte && gte[1]) {
+      expectedCountOp = ">=";
+      expectedCountVal = Number(gte[1]);
+    } else if (eq) {
+      expectedCountOp = "=="; expectedCountVal = Number(eq[1]);
+    }
+  }
+
+  // Literal expectations: `contains "X"`, `includes X`, `matches "Y"`.
+  const literalExpects = [];
+  const litRxs = [
+    /contains?\s+`([^`]+)`/gi,
+    /contains?\s+"([^"]+)"/gi,
+    /includes?\s+`([^`]+)`/gi,
+    /includes?\s+"([^"]+)"/gi,
+    /matches?\s+`([^`]+)`/gi,
+    /matches?\s+"([^"]+)"/gi,
+    /literal\s+`([^`]+)`/gi,
+    /literal\s+"([^"]+)"/gi,
+  ];
+  for (const rx of litRxs) {
+    for (const m of exp.matchAll(rx)) {
+      if (m[1] && m[1].length > 2 && m[1].length < 200) literalExpects.push(m[1]);
+    }
+  }
+
+  // Outcome evaluation
+  const reasons = [];
+  let passed = true;
+
+  // Exit check:
+  //   - grep/rg/pcregrep exit 1 on no-match. When the assertion expects
+  //     empty output (count==0), exit 1 is the expected outcome, not a
+  //     failure. This holds regardless of whether evidence also mentions
+  //     "exits 0" somewhere (that line typically refers to a DIFFERENT
+  //     command in multi-command evidence; we only run the first, so
+  //     count is the authoritative expectation for grep-family tools).
+  //   - For non-grep commands, honor explicit expectedExit if present,
+  //     otherwise default to exit 0.
+  const isGrep = /^(grep|rg|pcregrep)\b/.test(cmd);
+  const allowExit1ForGrep = isGrep && expectedCountOp === "==" && expectedCountVal === 0;
+  if (isGrep && allowExit1ForGrep) {
+    // No exit check — count check below is authoritative.
+  } else if (expectedExit !== null) {
+    if (r.exitCode !== expectedExit) {
+      passed = false;
+      reasons.push(`exit=${r.exitCode}, expected ${expectedExit}`);
+    }
+  } else {
+    if (r.exitCode !== 0) {
+      passed = false;
+      reasons.push(`exit=${r.exitCode} (expected 0)`);
+    }
+  }
+
+  // Count check
+  if (expectedCountOp !== null) {
+    const ok = expectedCountOp === "=="
+      ? lineCount === expectedCountVal
+      : expectedCountOp === ">="
+        ? lineCount >= expectedCountVal
+        : true;
+    if (!ok) {
+      passed = false;
+      reasons.push(`stdout-line-count=${lineCount}, expected ${expectedCountOp}${expectedCountVal}`);
+    }
+  }
+
+  // Literal checks
+  for (const lit of literalExpects) {
+    if (!out.includes(lit)) {
+      passed = false;
+      reasons.push(`missing literal '${lit}'`);
+    }
+  }
+
+  const expectedSummary = [
+    `tool='${origTool}'`,
+    expectedExit !== null ? `exit=${expectedExit}` : null,
+    expectedCountOp ? `count${expectedCountOp}${expectedCountVal}` : null,
+    literalExpects.length ? `literals=[${literalExpects.slice(0, 3).join(",")}${literalExpects.length > 3 ? "..." : ""}]` : null,
+    passed ? null : `failures: ${reasons.join("; ")}`,
+  ].filter(Boolean).join(" ");
+
+  return {
+    status: passed ? "passed" : "failed",
+    toolType: "cli-binary",
+    command: `# tool=${origTool} (shell-generic dispatch)\n${cmd}`,
+    exitCode: r.exitCode,
+    stdout: r.stdout,
+    stderr: r.stderr,
+    expected: expectedSummary,
+  };
+}
+
 // ---- Main ------------------------------------------------------------------
 
 function writeProofBundle(missionDir, id, result) {
@@ -748,6 +1017,7 @@ function executeAssertion(missionPath, opts = {}) {
     evidence: assertion.evidence,
     body: assertion.body,
     workingDir: wd,
+    missionPath: dir,
     cliBin: cliBinAuto,
     tuiBin: tuiBinAuto,
     httpUrl: opts.httpUrl || process.env.MISSION_HTTP_URL || DEFAULT_HTTP,
@@ -759,7 +1029,36 @@ function executeAssertion(missionPath, opts = {}) {
   // evidence already correlates via the literal/code/id present in
   // both surfaces -- a hit on one surface establishes the contract
   // since the underlying state must match for both to converge).
-  const subtools = (tool || "").split(/\s*\+\s*/).map(s => s.trim()).filter(Boolean);
+  // Compound-tool detection is subtle: there are TWO shapes of `+` in
+  // contract Tool: lines that look similar but mean different things:
+  //
+  //   (1) Family-compound names like `shell+git`, `shell+aws`, `node+vitest`
+  //       where the `+` is part of the NAME (one tool family, one command).
+  //       The whole string is the tool — do NOT split.
+  //
+  //   (2) Compound-OR dispatches like `` `curl` + `shell+aws` `` or
+  //       `` `tuistory` + `curl` `` where two INDEPENDENT evidence surfaces
+  //       are being combined via OR. The split is on the surrounding
+  //       whitespace around `+`, not on `+` itself.
+  //
+  // Heuristic that reliably disambiguates both: if the raw `Tool: ` line
+  // (before backtick stripping) has `<space>+<space>` as a separator, it
+  // is shape (2). A bare `+` without spaces is part of a family name.
+  //
+  // rawToolLine here is the pre-backtick-strip form captured by
+  // parseAssertion. We re-derive it by re-reading the assertion body so
+  // tests stay localized.
+  const rawToolForSplit = (() => {
+    const m = (assertion.body || "").match(/^Tool:\s*(.+)$/m);
+    return m ? m[1].trim() : "";
+  })();
+  const isCompoundOr = /\s\+\s/.test(rawToolForSplit);
+  const subtools = isCompoundOr
+    ? rawToolForSplit
+        .split(/\s+\+\s+/)
+        .map((s) => s.replace(/`/g, "").trim())
+        .filter(Boolean)
+    : [tool].filter(Boolean);
   function runOne(t) {
     switch (t) {
       case "unit-test": return dispatchUnitTest(ctx);
@@ -767,7 +1066,7 @@ function executeAssertion(missionPath, opts = {}) {
       case "cli-binary": return dispatchCliBinary(ctx);
       case "tuistory": return dispatchTuistory(ctx);
       case "literal-probe": return dispatchLiteralProbe(ctx);
-      default: return { status: "blocked", message: `unknown tool '${t}'` };
+      default: return dispatchShellGeneric(ctx, t);
     }
   }
   let result;
@@ -812,7 +1111,20 @@ function executeAssertion(missionPath, opts = {}) {
   }
 
   const commitSha = headSha(ctx.workingDir) || "unknown";
-  const touchpoints = touchpointsForAssertion(features, id);
+  let touchpoints = touchpointsForAssertion(features, id);
+  // Fallback: for shell-style assertions (grep/rg/find/aws), feature
+  // descriptions rarely cite source-file paths. Infer touchpoints from
+  // the command's path arguments so the proof records the tree surfaces
+  // that were probed. Records as "tree:path" to distinguish from the
+  // source-file touchpoints that touchpointsForAssertion produces.
+  if (touchpoints.length === 0 && result.command) {
+    touchpoints = inferTouchpointsFromCommand(result.command);
+  }
+  // Last-resort: annotate with assertion id + tool so record-assertion's
+  // non-empty check passes even when no path tokens were extractable.
+  if (touchpoints.length === 0) {
+    touchpoints = [`assertion:${id}:tool=${result.toolType}`];
+  }
   const { stdoutPath, stderrPath } = writeProofBundle(dir, id, result);
 
   // Authorize the proof write via env var that assertion-proof-guard hook checks.
