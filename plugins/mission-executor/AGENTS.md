@@ -30,13 +30,24 @@ the installed version.
 
 ## Rules specific to this plugin
 
-- Phase 3 EXECUTE MUST prefer `/oh-my-claudecode:team` when the runtime
-  exposes it. Only hand-roll `TeamCreate` + `Agent()` as a fallback (plain
-  Claude Code without OMC, or stripped environments). The `/team` skill
-  already implements stage routing, shutdown protocol, handoff docs, and
-  state files; hand-rolling duplicates that contract inline and drifts
-  from the OMC team runtime as it evolves. Detect availability via the
-  available-skills system-reminder at session start.
+- Phase 3 EXECUTE MUST evaluate the three-tier hierarchy before
+  dispatch: (1) `/oh-my-claudecode:team` if the skill is loaded; (2)
+  native Claude Code Agent Teams via `TeamCreate` + `Agent(team_name=...)`
+  + `SendMessage` when `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` exposes
+  them in the tool catalog; (3) sequential `Agent()` fallback otherwise.
+  Tier 1 and Tier 2 detection is inspection-only — grep the session's
+  system-reminder at Phase 3 start for the skill name and tool names.
+  Tier 2 additionally REQUIRES a smoke-probe with fall-through to
+  Tier 3 on internal error (upstream issue #40270): spawn one
+  throwaway `Agent(team_name=..., name="probe")` call with a trivial
+  no-op prompt and 60s timeout before any real batch dispatch; on
+  internal-error or timeout, abort Tier 2 for the whole mission and
+  fall through to Tier 3. See SKILL.md Phase 3 "Tier selection" for
+  the decision tree and Tier 2 caveats table (issues #33764, #40270,
+  #32110/#32987, #23506 — each with mitigation). Never run
+  mission-executor from `claude --agent <custom>` — upstream #23506
+  makes `Agent` with `team_name` unavailable there, and the Phase 3
+  degenerate-case abort fires if detected.
 - Never hand-write `validation-state.json`. `assertion-proof-guard.mjs` blocks
   it at the PreToolUse layer. Use `record-assertion.mjs` via
   `execute-assertion.mjs`.

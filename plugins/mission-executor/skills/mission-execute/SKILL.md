@@ -197,21 +197,55 @@ parallel execution batches (those in `likely-done-verify-first`,
 
 ### Phase 3: EXECUTE
 
-For each batch, use Claude Code native teams. **Prefer the `/team` slash
-command if the runtime exposes it** (OMC / oh-my-claudecode runtimes do);
-otherwise hand-roll via `TeamCreate` + `Agent()`.
+Dispatch each batch through the highest-priority team runtime available
+to the session. The orchestrator evaluates tier availability **once** at
+the start of Phase 3 via inspection of the session's system-reminder
+(plus a single smoke-probe on Tier 2) and sticks with the chosen tier
+for the whole mission.
 
-#### Preferred path: `/oh-my-claudecode:team` (when available)
+#### Tier selection (inspection-first, smoke-probe on Tier 2)
 
-If the active runtime exposes the `/oh-my-claudecode:team` slash command
-(detectable via the available-skills system reminder at session start), the
-orchestrator SHOULD dispatch each batch through that skill rather than
-hand-rolling the team primitives. The `/team` skill layers stage-aware
-agent routing, handoff documents, state-file persistence, and shutdown
-protocol on top of `TeamCreate` + `Agent()` — all of which this SKILL
-would otherwise have to reproduce inline. Dispatching to `/team`
-eliminates duplicated orchestration and keeps the team runtime version
-aligned with the rest of the user's OMC install.
+Evaluate in order and use the first match:
+
+1. **Tier 1 — OMC `/team`**: if `oh-my-claudecode:team` appears in the
+   session's available-skills list (in the system-reminder at session
+   start).
+2. **Tier 2 — Native Claude Code Agent Teams**: else, if `TeamCreate`,
+   `SendMessage`, AND `Agent` (with a `team_name` parameter) all appear
+   in the session's tool catalog. This signals that
+   `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` is set in settings.json
+   (introduced in Claude Code v2.1.32, docs at
+   https://code.claude.com/docs/en/agent-teams). Tool-catalog inspection
+   alone is insufficient — catalog presence does not guarantee `Agent`
+   with `team_name` actually succeeds (see caveat #40270 below). Tier 2
+   selection MUST include a throwaway smoke-probe before committing the
+   mission to this tier; see the "Mandatory preflight probe" subsection.
+3. **Tier 3 — Sequential `Agent()` fallback**: else, or whenever Tier 2
+   probe fails.
+
+Step 1 and 2 detection are inspection-only — grep the session's
+system-reminder text for the literal skill name and tool names. Do not
+invoke any tool just to test its availability at this step. Step 2's
+probe is a single real tool call; document it in the mission's
+progress-log before running.
+
+**Degenerate case**: if the `Agent` tool is absent from the catalog
+entirely (not just missing the `team_name` parameter), no tier works.
+This happens when the orchestrator itself was launched with
+`claude --agent <custom>` — upstream issue #23506 — and even Tier 3's
+hand-rolled `Agent()` call fails. Abort Phase 3 with an explicit error
+instructing the operator to re-run from plain `claude` (not
+`claude --agent`).
+
+#### Tier 1 — `/oh-my-claudecode:team` (when available)
+
+If OMC's `/team` skill is loaded, dispatch the batch through it. The
+skill layers stage-aware agent routing, handoff documents, state-file
+persistence, worktree isolation, dynamic scaling, role-routing configs,
+and shutdown protocol on top of the same `TeamCreate` +
+`Agent(team_name=...)` primitives Tier 2 uses. Dispatching here avoids
+reproducing ~800 lines of team-runtime contract inline and keeps the
+runtime version aligned with the rest of the user's OMC install.
 
 Invocation shape:
 ```
@@ -219,53 +253,118 @@ Skill("oh-my-claudecode:team", args=<task description + pre-computed
       feature batch + exec-worker-type + boundaries>)
 ```
 
-The orchestrator passes the batch through as the task description; `/team`
-decomposes internally, pre-assigns owners, spawns teammates, and drives
-the staged pipeline (team-plan -> team-exec -> team-verify -> team-fix).
-The orchestrator monitors progress via `SendMessage` checkpoints as a
-team-lead peer rather than managing every primitive call directly. On
-completion, the orchestrator takes the team's `whatWasDone` handoff and
-plumbs it into Phase 3's state write-back + Phase 4 VERIFY.
+The orchestrator passes the batch through as the task description;
+`/team` decomposes internally, pre-assigns owners, spawns teammates,
+and drives the staged pipeline (`team-plan` -> `team-exec` ->
+`team-verify` -> `team-fix`). The orchestrator monitors progress via
+`SendMessage` checkpoints as a team-lead peer rather than managing every
+primitive call directly. On completion, the orchestrator takes the
+team's `whatWasDone` handoff and plumbs it into Phase 3's state
+write-back + Phase 4 VERIFY.
 
-This path is preferred because it (a) avoids duplicating the ~800-line
-team runtime contract in this SKILL, (b) picks up OMC team improvements
-automatically (stage routing, worktree isolation, dynamic scaling,
-role-routing configs, cancellation integration), (c) interoperates
-cleanly with `/oh-my-claudecode:cancel` so mid-mission cancel reaches
-workers, and (d) surfaces standard OMC state files (`state_read mode=team`)
-for operator visibility.
+Benefits beyond raw primitives: interoperates cleanly with
+`/oh-my-claudecode:cancel` so mid-mission cancel reaches workers, and
+surfaces standard OMC state files (`state_read mode=team`) for operator
+visibility.
 
-#### Fallback path: hand-rolled team (when `/team` is not available)
+#### Tier 2 — Native Agent Teams (experimental; use only if OMC is unavailable AND `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` is already set in the host profile)
 
-If `/team` is not exposed (plain Claude Code without OMC, or a stripped
-environment), hand-roll the team primitives directly. This is the
-pre-0.4.1 default and remains the reference behavior:
+If OMC isn't installed but native teams are enabled, the orchestrator
+MAY hand-roll the team primitives directly — subject to the caveats
+and preflight probe below. Tier 2 uses the **same underlying toolset**
+Tier 1 wraps; what's missing is OMC's stage pipeline, state files, and
+cancel integration.
 
+**Tier 2 caveats (read BEFORE choosing this path):**
+
+| Issue | Symptom | Mitigation |
+|-------|---------|------------|
+| [anthropics/claude-code#33764](https://github.com/anthropics/claude-code/issues/33764) | `~/.claude/teams/` + `~/.claude/tasks/` are wiped on session restart. | mission-executor's authoritative state lives in `features.json` + `progress_log.jsonl` (persistent under `.factory/`) and survives restarts. Mitigates **in-flight batch state only**; does not recover cross-session team config. Cross-session missions MUST re-dispatch each batch and re-run the Tier 2 preflight probe on resumption. |
+| [anthropics/claude-code#40270](https://github.com/anthropics/claude-code/issues/40270) | `Agent` with `team_name` returns "Tool result missing due to internal error" in some tmux sessions, independent of prompt content. | Detection: the mandatory preflight probe (below). On probe failure, abort Tier 2 for the whole mission and fall through to Tier 3. Do not attempt per-batch retries on Tier 2 after probe failure — the failure is session-scoped, not batch-scoped. |
+| [anthropics/claude-code#32110](https://github.com/anthropics/claude-code/issues/32110) / [#32987](https://github.com/anthropics/claude-code/issues/32987) | Per-teammate model propagation is buggy — teammates inherit the lead's model instead of the `model=` param on `Agent()`. | Document `model=` on teammates as **advisory only** under Tier 2 until upstream fix lands. Prefer **uniform-model batches** (all teammates on the same tier) so the lead's model is the correct model for every worker. `/team` (Tier 1) already resolves this via role-routing config. |
+| [anthropics/claude-code#23506](https://github.com/anthropics/claude-code/issues/23506) | Custom-agent sessions (`claude --agent <name>`) don't expose `Agent` with `team_name`. Sometimes `Agent` itself is absent, not just its `team_name` parameter. | Split detection: if `Agent` is absent entirely from the catalog, abort Phase 3 (Tier 3 also fails — see "Degenerate case" above). If `Agent` is present but `team_name` parameter is missing from its signature, fall through to Tier 3 automatically. |
+
+**Mandatory preflight probe** (before any batch dispatch on Tier 2):
+
+Spawn one throwaway `Agent` call with `team_name="mission-preflight"`,
+`name="probe"`, `subagent_type="general-purpose"`, a trivial prompt
+(`"Reply 'ok' and return. Do not write files, do not claim tasks, do
+not spawn sub-agents."`), and a 60-second timeout. The probe MUST NOT
+claim any task, touch any file, or participate in the real batch — its
+only job is to verify the `Agent(team_name=...)` code path succeeds in
+this session. If the probe returns within 60s with a non-error result,
+select Tier 2 for the mission. If it returns "Tool result missing due
+to internal error" or times out, abort Tier 2 and record the fall-
+through in `progress_log.jsonl`; the mission proceeds on Tier 3. A
+Tier 2 → Tier 3 fall-through is sticky for the rest of the mission —
+the orchestrator MUST NOT re-probe mid-mission.
+
+Probe cost: ~$0.01 and ~60s wall time per mission when Tier 2 is a
+candidate. Zero cost when Tier 1 is selected (probe is skipped).
+
+**Invocation shape** (if probe passes):
 ```
 TeamCreate("mission-batch-N")
 
 For each feature in batch:
   TaskCreate(
     subject: "[M{milestone}] {skillName}: {feature.id}",
-    description: feature.description + preconditions + expectedBehavior + verificationSteps
+    description: feature.description + preconditions +
+                 expectedBehavior + verificationSteps
   )
   TaskUpdate(taskId, owner: "worker-N")
 
 Spawn workers with Agent(
-  subagent_type: "oh-my-claudecode:executor",
+  subagent_type: "executor",
   team_name: "mission-batch-N",
   name: "worker-N",
   prompt: <worker-preamble> + <feature-spec> + <boundaries> + <build-commands>
 )
 
-Monitor until all tasks complete or fail
-Shutdown workers -> TeamDelete
+Monitor via inbound SendMessage + TaskList polling until all tasks
+complete or fail.
+
+Shutdown workers via SendMessage(shutdown_request) -> await
+shutdown_response -> TeamDelete.
 ```
 
-Either path must respect the mission's Phase 3 contract: workers commit
-to git, the runner writes back features.json status via
-`sync-features-state.mjs`, and Phase 4 VERIFY drives the authoritative
-pass/fail via `execute-assertion.mjs`.
+#### Tier 3 — Sequential `Agent()` fallback
+
+If neither Tier 1 nor Tier 2 is available (or Tier 2 preflight probe
+failed), dispatch features through pure `Agent()` subagents with
+orchestrator-managed sequencing. This is the pre-0.4.0 reference
+behavior. No shared task list, no inter-agent messaging — the
+orchestrator drives each feature in sequence and synthesizes results
+across invocations.
+
+Invocation shape:
+```
+For each feature in batch (serially):
+  Agent(
+    subagent_type: "general-purpose" (or any available executor),
+    prompt: <worker-preamble> + <feature-spec> + <boundaries> +
+            <build-commands>
+  )
+  Wait for return, parse handoff, write back features.json via
+  sync-features-state.mjs, then advance to next feature.
+```
+
+Tier 3 is strictly slower than Tiers 1/2 for mixed-milestone batches
+(all work is serial). It preserves the Phase 3 contract: workers still
+commit to git, the runner still writes back `features.json` via
+`sync-features-state.mjs`, and Phase 4 VERIFY still drives the
+authoritative pass/fail via `execute-assertion.mjs`.
+
+#### Contract invariant (all tiers)
+
+Regardless of tier, Phase 3 must respect:
+
+- Workers commit their own work to git with scoped `git add`
+- The runner (not workers) writes back `features.json` status via
+  `node "${CLAUDE_PLUGIN_ROOT}/scripts/sync-features-state.mjs" "$MISSION_PATH"`
+  after the batch closes
+- Phase 4 VERIFY is authoritative for pass/fail; worker claims are
+  audit-only (`.omc/validation/worker-claims.jsonl`)
 
 **Worker Preamble** (injected into every worker):
 - Mission AGENTS.md boundaries (verbatim NEVER rules)
