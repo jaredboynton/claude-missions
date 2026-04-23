@@ -32,46 +32,15 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join, resolve, dirname, relative, isAbsolute } from "node:path";
 import { execSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 import { recordAssertion } from "./record-assertion.mjs";
-import { proofsDir } from "../hooks/_lib/paths.mjs";
-import { resolveChildRepo } from "./_lib/meta-repo.mjs";
+import { proofsDir, relativeProofPath } from "./_lib/mission-paths.mjs";
+import { upgradeLegacy052Proofs } from "./_lib/migrate.mjs";
 import { fileURLToPath as _fileURLToPath } from "node:url";
 import { realpathSync as _realpathSync } from "node:fs";
 
 const DEFAULT_HTTP = "http://127.0.0.1:4096";
-
-function headSha(workingDir) {
-  try {
-    return execSync("git rev-parse HEAD", { cwd: workingDir, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-  } catch {
-    return null;
-  }
-}
-
-// Meta-repo-aware HEAD resolution for proof tagging.
-//
-// Defect 3 (0.4.7): in a workspace with a .meta file listing child repos
-// that have their own .git/, work done in the child produces commits on a
-// separate history. Tagging a proof with workingDir's HEAD makes the
-// critic's `git merge-base --is-ancestor` check at workingDir fail forever
-// against child commits. Consult .meta via resolveChildRepo(); when the
-// first touchpoint routes into a declared child, return that child's HEAD
-// + name. Callers persist `childRepo` on the proof so the critic knows
-// which repo to ask for ancestry.
-function headShaForProof(workingDir, touchpoints) {
-  const first = Array.isArray(touchpoints) && touchpoints.length > 0 ? touchpoints[0] : null;
-  const child = first ? resolveChildRepo(first, workingDir) : null;
-  if (child) {
-    try {
-      const sha = execSync("git rev-parse HEAD", {
-        cwd: child.path, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
-      }).trim();
-      if (sha) return { sha, childRepo: child.name };
-    } catch { /* fall through to workingDir HEAD */ }
-  }
-  return { sha: headSha(workingDir) || "unknown", childRepo: null };
-}
 
 function loadMission(missionPath) {
   const dir = resolve(missionPath);
@@ -992,15 +961,17 @@ function dispatchShellGeneric(ctx, origTool) {
 // ---- Main ------------------------------------------------------------------
 
 function writeProofBundle(missionDir, id, result) {
-  // v0.5.0: proofs now land under the project-scoped layoutRoot()/validation/
-  // (resolved by hooks/_lib/paths.mjs) instead of the mission-relative
-  // .omc/validation/ path. Legacy OMC users auto-detect back to .omc/.
-  const base = proofsDir(id);
+  // v0.6.0: proofs live INSIDE the mission directory at
+  // <missionDir>/validation/proofs/<id>/. Matches droid's
+  // MissionFileService convention so dual-runtime tooling shares the layout.
+  // Stored proof.stdoutPath / stderrPath are RELATIVE to missionDir so
+  // missions remain portable if relocated.
+  const base = proofsDir(missionDir, id);
   mkdirSync(base, { recursive: true });
-  const stdoutPath = join(base, "stdout.txt");
-  const stderrPath = join(base, "stderr.txt");
-  writeFileSync(stdoutPath, result.stdout ?? "");
-  writeFileSync(stderrPath, result.stderr ?? "");
+  const stdoutAbs = join(base, "stdout.txt");
+  const stderrAbs = join(base, "stderr.txt");
+  writeFileSync(stdoutAbs, result.stdout ?? "");
+  writeFileSync(stderrAbs, result.stderr ?? "");
   const meta = {
     id,
     toolType: result.toolType,
@@ -1010,10 +981,19 @@ function writeProofBundle(missionDir, id, result) {
     executedAt: new Date().toISOString(),
   };
   writeFileSync(join(base, "meta.json"), JSON.stringify(meta, null, 2) + "\n");
-  return { stdoutPath, stderrPath };
+  return {
+    stdoutPath: relativeProofPath(id, "stdout"),
+    stderrPath: relativeProofPath(id, "stderr"),
+    stdoutAbs,
+    stderrAbs,
+  };
 }
 
 function executeAssertion(missionPath, opts = {}) {
+  // One-shot migration of any 0.5.x proofs in this mission to the 0.6.0
+  // schema + path layout. Idempotent: no-op once migrated.
+  try { upgradeLegacy052Proofs(missionPath); } catch { /* never fatal */ }
+
   const { dir, features, contract, workingDir } = loadMission(missionPath);
   const id = opts.id;
   if (!id) return { ok: false, error: "--id=VAL-... required" };
@@ -1152,9 +1132,6 @@ function executeAssertion(missionPath, opts = {}) {
   if (touchpoints.length === 0) {
     touchpoints = [`assertion:${id}:tool=${result.toolType}`];
   }
-  // Resolve commit SHA AFTER touchpoints so meta-repo detection can route
-  // into the child that actually owns the work (defect 3 fix).
-  const { sha: commitSha, childRepo } = headShaForProof(ctx.workingDir, touchpoints);
   const { stdoutPath, stderrPath } = writeProofBundle(dir, id, result);
 
   // Defect 2 (0.4.7): when the critic's Stage B spot-checks a passed
@@ -1165,17 +1142,14 @@ function executeAssertion(missionPath, opts = {}) {
   // dispatcher parses differently than the original record path), causing
   // idempotency loss across successive critic runs.
   //
-  // The proof bundle under .omc/validation/proofs/<id>/ is still written:
-  // it is an idempotent side output, and having a fresh bundle on disk is
-  // useful for operator diagnosis without affecting authoritative state.
+  // The proof bundle under <missionDir>/validation/proofs/<id>/ is still
+  // written: idempotent side output, useful for operator diagnosis.
   if (process.env.CRITIC_SPOT_CHECK === "1") {
     return {
       ok: true,
       id,
       status: result.status,
       toolType: result.toolType,
-      commitSha,
-      childRepo: childRepo || null,
       exitCode: result.status === "passed" ? 0 : 1,
       expected: result.expected,
       observed: { exitCode: result.exitCode, stdoutPath, stderrPath },
@@ -1186,19 +1160,23 @@ function executeAssertion(missionPath, opts = {}) {
   // Authorize the proof write via env var that assertion-proof-guard hook checks.
   process.env.MISSION_EXECUTOR_WRITER = "1";
 
+  // v0.6.0: hash the assertion block from validation-contract.md at the time
+  // of execution. invalidate-stale-evidence.mjs compares this on later runs
+  // to detect when the orchestrator has edited the assertion's criteria —
+  // the droid-style staleness signal replacing git-ancestry.
+  const contractSha256 = createHash("sha256").update((assertion.body || "").trim()).digest("hex");
+
   const record = recordAssertion(dir, {
     id,
     status: result.status, // "passed" or "failed"
     evidence: result.expected,
-    "commit-sha": commitSha,
     "tool-type": result.toolType,
     command: result.command,
     "exit-code": String(result.exitCode),
     "stdout-path": stdoutPath,
     "stderr-path": stderrPath,
     touchpoints: touchpoints.join(","),
-    "working-dir": ctx.workingDir,
-    ...(childRepo ? { "child-repo": childRepo } : {}),
+    "contract-sha256": contractSha256,
   });
 
   // record-assertion rejects passed-without-proof; ensure we only proceed when
@@ -1212,8 +1190,6 @@ function executeAssertion(missionPath, opts = {}) {
     id,
     status: result.status,
     toolType: result.toolType,
-    commitSha,
-    childRepo: childRepo || null,
     exitCode: result.status === "passed" ? 0 : 1,
     expected: result.expected,
     observed: {
