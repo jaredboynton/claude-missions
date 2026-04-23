@@ -18,6 +18,18 @@ human-readable report format below via `mission-query.mjs`, but for just
 "what phase is the mission in / who is attached / is it complete?" the
 slash command is faster and doesn't require skill-invocation context.
 
+**v0.5.1**: `mission-cli status` now also includes derived worker states and
+active-worker session-ids computed from `<missionPath>/progress_log.jsonl`
+(see [skills/mission-execute/SKILL.md](../mission-execute/SKILL.md)'s
+"Progress log" section for the event vocabulary). Output shape gains two
+optional fields:
+```
+"workers": { "<workerSessionId>": { "startedAt", "completedAt?", "exitCode?", "failed?" } }
+"activeWorkers": [ "<workerSessionId>", ... ]
+```
+These are populated whenever progress_log exists for the mission; absent
+otherwise.
+
 ## Input
 
 - `<mission-path>`: Path to `.factory/missions/<id>/` directory. Auto-discovers if omitted.

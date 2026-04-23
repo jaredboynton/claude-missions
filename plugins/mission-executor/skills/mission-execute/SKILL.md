@@ -131,6 +131,51 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/mission-cli.mjs" phase "3-execute" --session
 ```
 `mission-lifecycle.mjs phase` also works (thin delegator; same contract).
 
+## Progress log (v0.5.1+)
+
+Every lifecycle subcommand auto-appends an event to
+`<missionPath>/progress_log.jsonl`:
+
+- `start` -> `mission_started` or `session_attached`
+- `attach` -> `session_attached`
+- `detach` -> `session_detached`
+- `phase` -> `phase_transition` (with `{ from, to }`)
+- `complete` -> `mission_completed` (with `forced` flag)
+- `abort` -> `mission_aborted`
+- legacy-migration path -> `legacy_migration_completed`
+
+For events that mission-cli doesn't auto-emit (worker lifecycle, handoff,
+assertion runs), use the explicit subcommand:
+
+```bash
+# Before dispatching a worker Agent/Task:
+node "${CLAUDE_PLUGIN_ROOT}/scripts/mission-cli.mjs" event worker_started \
+  --session-id="<sid>" --worker="<workerId>" --feature="<featureId>"
+
+# After the worker Agent returns:
+node "${CLAUDE_PLUGIN_ROOT}/scripts/mission-cli.mjs" event worker_completed \
+  --session-id="<sid>" --worker="<workerId>" --exit-code=0
+
+# Or on failure:
+node "${CLAUDE_PLUGIN_ROOT}/scripts/mission-cli.mjs" event worker_failed \
+  --session-id="<sid>" --worker="<workerId>" --exit-code=1 --reason="timeout"
+```
+
+Event-type vocabulary (match droid where meaningful): `mission_started`,
+`mission_paused`, `mission_resumed`, `mission_completed`, `mission_aborted`,
+`session_attached`, `session_detached`, `legacy_migration_completed`,
+`phase_transition`, `worker_started`, `worker_completed`, `worker_failed`,
+`worker_paused`, `worker_stranded`, `milestone_validation_triggered`,
+`assertion_executed`, `handoff_written`. Use these verbatim so dual-runtime
+tooling (droid post-mortems, our `mission-cli status`) can parse consistently.
+
+Hooks do NOT write to progress_log; they stay on `hook-audit.log`. The only
+exception is the one-shot migration writer in `hooks/_lib/mission-state.mjs`.
+
+`mission-cli status` reads progress_log to surface derived worker states
+(`{ [workerSessionId]: { startedAt, completedAt, exitCode, failed? } }`)
+and `activeWorkers[]` (sessions with a start but no terminal event).
+
 At each phase transition, update the phase label so operator logs track progress:
 
 ```bash
@@ -298,6 +343,31 @@ to the session. The orchestrator evaluates tier availability **once** at
 the start of Phase 3 via inspection of the session's system-reminder
 (plus a single smoke-probe on Tier 2) and sticks with the chosen tier
 for the whole mission.
+
+#### Worker event emission (v0.5.1+)
+
+Before EACH `Agent(...)` / `Task(...)` dispatch, append a `worker_started`
+event to progress_log via `mission-cli event`:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/mission-cli.mjs" event worker_started \
+  --session-id="<sid>" --worker="<workerId>" --feature="<featureId>"
+```
+
+After the worker returns, emit `worker_completed` (success) or
+`worker_failed` (non-zero exit / thrown error / detected regression):
+
+```bash
+# on success:
+node .../mission-cli.mjs event worker_completed --session-id=<sid> --worker=<workerId> --exit-code=0
+# on failure:
+node .../mission-cli.mjs event worker_failed --session-id=<sid> --worker=<workerId> --exit-code=1 --reason="test suite red"
+```
+
+These are advisory events (audit trail), NOT the authoritative completion
+path. Phase 4's `execute-assertion.mjs` still owns the `passed` status
+transition. Without these events, `mission-cli status` can't surface
+derived worker states and post-mortems lose per-worker timing.
 
 #### Tier selection (inspection-first, smoke-probe on Tier 2)
 
@@ -517,6 +587,42 @@ The invalidator demotes every such entry to `stale` so Phase 4b re-runs
 them from scratch.
 
 ### Phase 4b: VERIFY (driven by execute-assertion.mjs)
+
+#### Writing worker handoffs (v0.5.1+)
+
+As each feature completes, the orchestrator MUST write a validated handoff
+JSON via `write-handoff.mjs`. This replaces the v0.4.x "ad-hoc bash
+heredoc" pattern and is the canonical worker-return contract.
+
+```bash
+# Assemble the handoff JSON in-context, then pipe:
+cat <<'JSON' | node "${CLAUDE_PLUGIN_ROOT}/scripts/write-handoff.mjs" "$MISSION_PATH"
+{
+  "workerSessionId": "<worker-session-id>",
+  "featureId": "<feature-id>",
+  "milestone": "<M1|M2|...>",
+  "successState": "success",
+  "salientSummary": "1-4 sentences, 20-500 chars. What changed and why it's ready.",
+  "whatWasDone": ["bullet", "list"],
+  "whatWasLeftUndone": ["bullet", "list"],
+  "discoveredIssues": [{ "severity": "high|medium|low|critical", "description": ">=10 chars" }],
+  "commitShas": ["abc1234"],
+  "returnToOrchestrator": "optional free-form"
+}
+JSON
+```
+
+Exit 0 = handoff written at `$MISSION_PATH/handoffs/<ts>__<feat>__<worker>.json`
+plus a `handoff_written` event appended to progress_log. Exit 1 = schema
+validation failed; fix the input and retry (the failure JSON lists every
+error). Exit 2 = bad args.
+
+Schema source of truth: `scripts/_lib/schemas.mjs > workerHandoffSchema`.
+
+Use `--force-skip-validation` ONLY when recovering from a corrupt spec
+where the schema itself is wrong; the output gets tagged `_unverified: true`.
+
+#### Running the assertions
 
 For every assertion in validation-state.json that is `pending` or `stale`,
 run `execute-assertion.mjs`. This is the ONLY path that writes
