@@ -1,6 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { sandbox, runCli, readJson } from "./_helpers.mjs";
+
+function readProgressLog(missionPath) {
+  const p = join(missionPath, "progress_log.jsonl");
+  if (!existsSync(p)) return [];
+  return readFileSync(p, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+}
 
 test("detach of non-attached session -> exit 3", () => {
   const s = sandbox();
@@ -21,6 +29,12 @@ test("detach of non-last driver without heartbeat -> OK", () => {
     const state = readJson(s.stateFile);
     assert.equal(state.attachedSessions.length, 1);
     assert.equal(state.attachedSessions[0].sessionId, "sidB");
+    // v0.5.1: emits session_detached
+    const events = readProgressLog(s.missionPath);
+    const det = events.find((e) => e.type === "session_detached");
+    assert.ok(det);
+    assert.equal(det.sessionId, "sidA");
+    assert.equal(det.remaining, 1);
   } finally { s.cleanup(); }
 });
 

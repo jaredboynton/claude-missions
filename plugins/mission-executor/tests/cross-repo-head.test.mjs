@@ -23,6 +23,7 @@ import { PLUGIN_ROOT } from "./_mission-fixture.mjs";
 
 const EXECUTE = join(PLUGIN_ROOT, "scripts/execute-assertion.mjs");
 const CRITIC = join(PLUGIN_ROOT, "scripts/critic-evaluator.mjs");
+const INVALIDATE = join(PLUGIN_ROOT, "scripts/invalidate-stale-evidence.mjs");
 
 function gitEnv() {
   return {
@@ -224,4 +225,37 @@ test("critic ancestry check uses child repo when proof.childRepo set", async (t)
   const staleOnChild = stageAIssues.find((i) => i.id === "VAL-CHILD-001" && i.category === "stale-commit");
   assert.equal(staleOnChild, undefined,
     `child-repo proof flagged stale after outer advance: ${JSON.stringify(staleOnChild)}`);
+});
+
+test("invalidate-stale-evidence respects proof.childRepo", async (t) => {
+  const fx = buildMetaRepo();
+  t.after(() => fx.cleanup());
+
+  // Capture a child-repo proof.
+  const exec = runExecute(fx, "VAL-CHILD-001");
+  assert.equal(exec.code, 0);
+
+  // Advance the OUTER repo only. The child proof's SHA should remain a
+  // valid ancestor of the child's HEAD (unchanged), so invalidation should
+  // keep it healthy. Pre-fix: invalidate ran git ops at workingDir only and
+  // would mark it stale.
+  writeFileSync(join(fx.workingDir, "NEW_OUTER.md"), "bump\n");
+  execSync("git add -A && git commit -qm bump", { cwd: fx.workingDir, env: { ...process.env, ...gitEnv() } });
+
+  const r = spawnSync(process.execPath, [INVALIDATE, fx.missionPath], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      CLAUDE_PROJECT_DIR: fx.workingDir,
+      MISSION_EXECUTOR_LAYOUT_ROOT: join(fx.missionPath, "_layout"),
+    },
+  });
+  assert.equal(r.status, 0, `invalidate failed:\n${r.stdout}\n${r.stderr}`);
+  let json = null;
+  try { json = JSON.parse(r.stdout); } catch {}
+  const wasInvalidated = (json?.invalidated || []).find((i) => i.id === "VAL-CHILD-001");
+  assert.equal(wasInvalidated, undefined,
+    `child-repo proof was invalidated by pre-critic pass: ${JSON.stringify(wasInvalidated)}`);
+  assert.equal(json?.healthy, 1,
+    `expected 1 healthy assertion (the child-repo proof), got ${json?.healthy}`);
 });
