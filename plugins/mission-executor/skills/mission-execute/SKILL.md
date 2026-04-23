@@ -571,10 +571,18 @@ even though the code shipped.
 
 ### Phase 4a: INVALIDATE STALE EVIDENCE
 
-Before running any new assertion, sweep prior proofs that are no longer
-fresh. A passed assertion whose `proof.commitSha` is not an ancestor of
-HEAD (or whose touchpoints changed since the proof was captured) is
-flipped to `stale` and its proof bundle is archived.
+Before running any new assertion, sweep prior proofs whose contract text
+has changed. v0.6.0 uses a droid-aligned model: proofs carry
+`proof.contractSha256` (hash of the assertion's block in
+`validation-contract.md` at execution time). On subsequent runs, any
+drift between the recorded hash and the current contract block flips the
+assertion to `stale` and archives its proof bundle.
+
+Assertions deleted from the contract are also flipped to `stale`.
+
+Proofs with no `proof.contractSha256` field (legacy 0.5.x and earlier) are
+left alone — they'll pick up a hash on their next re-execute via
+`execute-assertion.mjs`.
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/invalidate-stale-evidence.mjs" "$MISSION_PATH"
@@ -585,6 +593,15 @@ prior wave had 95 passed assertions with evidence strings reading
 `"critic-confirmed in prior session"`. No command had been run this run.
 The invalidator demotes every such entry to `stale` so Phase 4b re-runs
 them from scratch.
+
+**No more git ancestry checks.** 0.5.x's `proof.commitSha + git merge-base
+--is-ancestor` staleness signal was removed in 0.6.0. The
+mission-executor runtime makes no git calls during validation; staleness
+is purely contract-driven, matching droid's
+`organized/uncategorized/0801.js:1649` convention ("If the change
+invalidates a previous `"passed"` result, reset the status to
+`"pending"`"). Missions now run cleanly inside meta-repos and across
+force-pushes without any per-repo awareness.
 
 ### Phase 4b: VERIFY (driven by execute-assertion.mjs)
 
@@ -649,27 +666,36 @@ Tool-type dispatch (internal to execute-assertion.mjs):
 | `literal-probe` | `rg --fixed-strings` declared literal against repo | ≥1 match |
 
 Each execution writes a proof bundle to
-`.omc/validation/proofs/<id>/{stdout.txt,stderr.txt,meta.json}` and
-records:
+`<missionPath>/validation/proofs/<id>/{stdout.txt,stderr.txt,meta.json}`
+(v0.6.0: mission-scoped, not workingDir-scoped) and records:
 
 ```json
 {
   "status": "passed",
   "proof": {
-    "commitSha": "<HEAD at execution>",
     "toolType": "curl",
     "command": "curl -sS ...",
     "exitCode": 0,
     "stdoutSha256": "...",
     "stderrSha256": "...",
-    "stdoutPath": ".omc/validation/proofs/VAL-X/stdout.txt",
-    "stderrPath": ".omc/validation/proofs/VAL-X/stderr.txt",
+    "stdoutPath": "validation/proofs/VAL-X/stdout.txt",
+    "stderrPath": "validation/proofs/VAL-X/stderr.txt",
     "touchpoints": ["packages/kep/src/..."],
     "executedAt": "2026-04-18T...",
-    "executor": "execute-assertion.mjs"
+    "executor": "execute-assertion.mjs",
+    "contractSha256": "<sha256 of the assertion's block in validation-contract.md>"
   }
 }
 ```
+
+**v0.6.0 schema notes**:
+- Proof paths are **missionPath-relative** (not workingDir-anchored), so
+  missions remain portable if the directory is moved.
+- `proof.contractSha256` (new in 0.6.0) is the hash of the assertion's
+  block from `validation-contract.md` at execution time —
+  `invalidate-stale-evidence.mjs` uses this as the staleness signal.
+- `proof.commitSha` and `proof.childRepo` (0.5.x-only) are gone.
+  Mission-executor no longer reads git history for validation freshness.
 
 record-assertion.mjs REJECTS `passed` without these fields.
 
@@ -691,12 +717,17 @@ the critic runs.
 Run `critic-evaluator.mjs`. Stage A verifies for every `passed`
 assertion:
 
-- `proof` block present with all required fields
-- `proof.commitSha` is an ancestor of HEAD
+- `proof` block present with all required fields (toolType, command,
+  exitCode, stdoutPath, stderrPath, touchpoints, executedAt)
 - recomputed sha256 of `stdoutPath`/`stderrPath` matches proof
 
 Any failure here means a proof was tampered with or never produced. The
 critic returns verdict `INCOMPLETE` / `FAIL` and does NOT proceed to Stage B.
+
+**v0.6.0**: the git-ancestry check (`proof.commitSha` is-ancestor of HEAD)
+is gone. Staleness is detected by Phase 4a's contract-hash comparison,
+not by the critic. Stage A is purely a content-integrity check on the
+proof bundle files.
 
 ### Phase 5b: CRITIC — STAGE B (spot re-execute)
 

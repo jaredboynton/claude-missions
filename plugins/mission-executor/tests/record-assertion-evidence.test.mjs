@@ -34,13 +34,13 @@ test("--evidence replaces prior value on second passed-record", async (t) => {
   const fx = buildGreenMission();
   t.after(() => fx.cleanup());
 
-  // Re-record VAL-TEST-001 with evidence "A"
-  const proofDir = join(fx.missionPath, ".omc", "validation", "proofs", "VAL-TEST-001");
+  // Re-record VAL-TEST-001 with evidence "A". Proof paths are missionPath-
+  // relative per 0.6.0; record-assertion resolves them against missionDir.
+  const proofDir = join(fx.missionPath, "validation", "proofs", "VAL-TEST-001");
   const r1 = runRecord(fx, {
     id: "VAL-TEST-001",
     status: "passed",
     evidence: "first-evidence-A",
-    "commit-sha": fx.headSha,
     "tool-type": "cli-binary",
     command: "test -e hello.txt",
     "exit-code": "0",
@@ -56,7 +56,6 @@ test("--evidence replaces prior value on second passed-record", async (t) => {
     id: "VAL-TEST-001",
     status: "passed",
     evidence: "second-evidence-B",
-    "commit-sha": fx.headSha,
     "tool-type": "cli-binary",
     command: "test -e hello.txt",
     "exit-code": "0",
@@ -75,12 +74,11 @@ test("--evidence omitted on passed-record preserves prior evidence and emits WAR
   const fx = buildGreenMission();
   t.after(() => fx.cleanup());
 
-  const proofDir = join(fx.missionPath, ".omc", "validation", "proofs", "VAL-TEST-001");
+  const proofDir = join(fx.missionPath, "validation", "proofs", "VAL-TEST-001");
   // Omit --evidence
   const r = runRecord(fx, {
     id: "VAL-TEST-001",
     status: "passed",
-    "commit-sha": fx.headSha,
     "tool-type": "cli-binary",
     command: "test -e hello.txt",
     "exit-code": "0",

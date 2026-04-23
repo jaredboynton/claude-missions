@@ -124,7 +124,11 @@ Rules:
   (e.g. mission-cli `event` returns `3` for not-attached, `4` for bad input).
 - Silent-swallow pattern for progress-log writes: a progress-log failure
   MUST NEVER fail the calling command. See `mission-cli.mjs > emitEvent`.
-- All on-disk paths via `hooks/_lib/paths.mjs` helpers.
+- Project-scoped paths via `hooks/_lib/paths.mjs` (state, sessions,
+  hook-audit). Mission-scoped paths via `scripts/_lib/mission-paths.mjs`
+  (proofs, handoffs, progress log, working_directory.txt). Keep the two
+  separate — mission-scoped helpers take `missionPath` as an argument and
+  never consult `layoutRoot()`.
 - Never hand-write `validation-state.json` — `assertion-proof-guard.mjs`
   blocks it at PreToolUse. Route through `record-assertion.mjs` via
   `execute-assertion.mjs`.
@@ -185,7 +189,16 @@ Do not:
 
 - Do not bump `plugin.json` / `marketplace.json` version without a matching
   `CHANGELOG.md` entry in the same commit
-- Do not rename or delete exports from `hooks/_lib/paths.mjs` — 1.0.0 candidate
+- Do not rename or delete exports from `hooks/_lib/paths.mjs` or
+  `scripts/_lib/mission-paths.mjs` — 1.0.0 candidates
+- Do not re-introduce `proof.commitSha` or `proof.childRepo`. v0.6.0
+  dropped the git-ancestry staleness model; staleness is now
+  contract-hash-driven via `proof.contractSha256`. Meta-repo awareness is
+  intentionally absent — a mission operates on exactly one repo pointed to
+  by `<missionPath>/working_directory.txt`, droid convention.
+- Do not introduce cross-repo touchpoint routing (`.meta` walking, child
+  git repos). Cross-repo coordination requires multiple missions, not
+  one mission spanning repos.
 - Do not remove the `.omc/` autodetect branch in `paths.mjs > layoutRoot()`
   without a documented migration for 0.4.x missions — 1.0.0 candidate
 - Do not move `hooks/hooks.json` into `.claude-plugin/` — Claude Code's
@@ -411,3 +424,56 @@ See `CHANGELOG.md` for the feature overview. Quick reference:
   `scripts/_lib/schemas.mjs`
 - The 8 enforcement hooks do NOT touch progress_log — they stay on
   `hook-audit.log`. Bright line.
+
+## Appendix G — Droid alignment + 0.6.0 migration
+
+### Storage model (single-repo mission)
+
+A mission operates on exactly one git repo pointed to by
+`<missionPath>/working_directory.txt`. Matches droid's
+`MissionFileService` convention at
+`organized/core-services/0806.js:568`. Cross-repo work requires multiple
+missions, not one mission spanning repos. Meta-repo awareness
+(`.meta`-file walking, child-repo HEAD routing) is intentionally absent.
+
+- Mission artifacts live under `<missionPath>/` (validation-contract.md,
+  validation-state.json, features.json, working_directory.txt,
+  progress_log.jsonl, handoffs/, validation/proofs/). 0.5.x placed
+  proof bundles under `<workingDir>/.mission-executor/validation/`; 0.6.0
+  moves them into `<missionPath>/validation/`.
+- Project-scoped state (mission-executor-state.json, session markers,
+  hook-audit.log) stays in `<workingDir>/.mission-executor/state/` via
+  `hooks/_lib/paths.mjs`. This tracks "is this project running a mission",
+  not mission content.
+
+### Staleness model
+
+Pure droid: no automatic git-ancestry invalidation. The only automatic
+staleness signal is contract drift — `invalidate-stale-evidence.mjs`
+compares each passed assertion's `proof.contractSha256` against the
+current assertion block in `validation-contract.md`. Drift means the
+orchestrator edited the assertion's criteria and the proof is no longer
+valid. Matches droid's `organized/uncategorized/0801.js:1649` rule
+("If the change invalidates a previous `"passed"` result, reset the
+status to `"pending"`").
+
+Force-push, rebase, branch-switch, and touchpoint-edit-without-contract-
+edit are explicitly NOT detected. Operators who want a proof re-run
+should flip the assertion to `pending` manually, or edit the contract
+(even cosmetically) to trigger the hash drift.
+
+### Legacy 0.5.x migration
+
+`scripts/_lib/migrate.mjs > upgradeLegacy052Proofs(missionPath)` runs at
+the top of `executeAssertion` and `evaluateMission`. First touch: strips
+`proof.commitSha` and `proof.childRepo`, moves proof bundle files from
+`<workingDir>/.mission-executor/validation/` or
+`<workingDir>/.omc/validation/` into `<missionPath>/validation/`, and
+rewrites stored paths to be missionPath-relative. Logs once to stderr
+when it runs. Idempotent after first migration.
+
+Proofs with MISSING bundle files on disk (force-push dropped them, or
+the workingDir got wiped) flip to `status: pending` — the next
+`execute-assertion` run regenerates them.
+
+See `tests/upgrade-legacy-052-proofs.test.mjs` for fixture shapes.

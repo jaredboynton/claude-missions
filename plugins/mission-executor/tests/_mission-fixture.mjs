@@ -90,7 +90,9 @@ export function buildGreenMission({ files = {}, assertions } = {}) {
   const assertionsState = {};
   const executedAt = new Date().toISOString();
   for (const a of baseAssertions) {
-    const proofDir = join(missionPath, ".omc", "validation", "proofs", a.id);
+    // v0.6.0: proofs live under <missionPath>/validation/proofs/<id>/ (was
+    // .omc/validation/proofs/<id>/ in pre-0.5.x, layoutRoot-scoped in 0.5.x).
+    const proofDir = join(missionPath, "validation", "proofs", a.id);
     mkdirSync(proofDir, { recursive: true });
     const stdoutContent = "";
     const stderrContent = "";
@@ -112,12 +114,12 @@ export function buildGreenMission({ files = {}, assertions } = {}) {
       validatedAtMilestone: "M1",
       evidence: expected,
       proof: {
-        commitSha: headSha,
         toolType: "cli-binary",
         command,
         exitCode: 0,
-        stdoutPath: join(".omc", "validation", "proofs", a.id, "stdout.txt"),
-        stderrPath: join(".omc", "validation", "proofs", a.id, "stderr.txt"),
+        // Paths stored as missionPath-relative per 0.6.0 convention.
+        stdoutPath: join("validation", "proofs", a.id, "stdout.txt"),
+        stderrPath: join("validation", "proofs", a.id, "stderr.txt"),
         stdoutSha256: sha256(stdoutContent),
         stderrSha256: sha256(stderrContent),
         touchpoints: [a.touchpoint],
