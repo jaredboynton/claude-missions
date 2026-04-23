@@ -30,28 +30,46 @@ function run(cmd, cwd) {
   }
 }
 
-function isAncestor(sha, workingDir) {
+// Defect 3 (0.4.7): mirror critic-evaluator's meta-repo-aware ancestry check.
+// When proof.childRepo is set, ancestry lives in that child's git history,
+// not the workspace-root repo. Without this, the pre-critic invalidation
+// pass downgrades healthy child-repo proofs whenever the outer repo advances.
+function childCwd(workingDir, childRepo) {
+  return childRepo ? resolve(workingDir, childRepo) : workingDir;
+}
+
+function isAncestor(sha, workingDir, childRepo) {
+  const cwd = childCwd(workingDir, childRepo);
   try {
-    execSync(`git merge-base --is-ancestor ${sha} HEAD`, { cwd: workingDir, stdio: ["ignore", "pipe", "ignore"] });
+    execSync(`git merge-base --is-ancestor ${sha} HEAD`, { cwd, stdio: ["ignore", "pipe", "ignore"] });
     return true;
   } catch {
     return false;
   }
 }
 
-function newestCommitForPath(path, workingDir) {
-  return run(`git log -1 --format=%H -- "${path}"`, workingDir);
+function newestCommitForPath(path, workingDir, childRepo) {
+  // For child-repo proofs, strip the child-dir prefix from the touchpoint so
+  // git log runs on the path as the child sees it.
+  const cwd = childCwd(workingDir, childRepo);
+  const relPath = childRepo && path.startsWith(`${childRepo}/`) ? path.slice(childRepo.length + 1) : path;
+  return run(`git log -1 --format=%H -- "${relPath}"`, cwd);
 }
 
-function touchpointChangedSince(touchpoints, proofSha, workingDir) {
+function touchpointChangedSince(touchpoints, proofSha, workingDir, childRepo) {
   if (!touchpoints || touchpoints.length === 0) return false;
+  const cwd = childCwd(workingDir, childRepo);
   for (const tp of touchpoints) {
-    const newest = newestCommitForPath(tp, workingDir);
+    // Skip synthetic annotations we attach when no real path is known.
+    if (tp.startsWith("assertion:")) continue;
+    // tree: prefix is execute-assertion's command-inferred form; strip for git.
+    const cleaned = tp.replace(/^tree:/, "");
+    const newest = newestCommitForPath(cleaned, workingDir, childRepo);
     if (!newest) continue;
     // If the newest commit touching this path is NOT an ancestor of proofSha,
     // the path was modified after the proof was captured.
     try {
-      execSync(`git merge-base --is-ancestor ${newest} ${proofSha}`, { cwd: workingDir, stdio: ["ignore", "pipe", "ignore"] });
+      execSync(`git merge-base --is-ancestor ${newest} ${proofSha}`, { cwd, stdio: ["ignore", "pipe", "ignore"] });
     } catch {
       return true;
     }
@@ -110,12 +128,13 @@ function invalidateStaleEvidence(missionPath, { dryRun = false } = {}) {
       continue;
     }
 
-    const ancestor = isAncestor(proof.commitSha, workingDir);
-    const tpChanged = touchpointChangedSince(proof.touchpoints || [], proof.commitSha, workingDir);
+    const ancestor = isAncestor(proof.commitSha, workingDir, proof.childRepo);
+    const tpChanged = touchpointChangedSince(proof.touchpoints || [], proof.commitSha, workingDir, proof.childRepo);
 
     if (!ancestor || tpChanged) {
+      const scope = proof.childRepo ? `${proof.childRepo} HEAD` : "HEAD";
       const reason = !ancestor
-        ? `proof.commitSha ${proof.commitSha.slice(0, 12)} not ancestor of HEAD`
+        ? `proof.commitSha ${proof.commitSha.slice(0, 12)} not ancestor of ${scope}`
         : `touchpoint changed since ${proof.commitSha.slice(0, 12)}`;
       invalidated.push({ id, reason, proofSha: proof.commitSha });
       if (!dryRun) {
