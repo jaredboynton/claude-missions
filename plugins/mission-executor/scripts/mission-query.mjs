@@ -97,8 +97,10 @@ function assertionSummary(missionPath) {
     else if (s === "failed") failedIds.push(id);
     else if (s === "blocked") blockedIds.push(id);
     else if (s === "passed") {
+      // v0.6.0: proof must carry toolType + command + stdoutPath at minimum.
+      // commitSha / childRepo dropped with the git-ancestry model.
       const p = entry.proof;
-      if (!p || !p.commitSha || !p.stdoutPath) passedWithoutProof.push(id);
+      if (!p || !p.toolType || !p.command || !p.stdoutPath) passedWithoutProof.push(id);
     }
   }
   return {

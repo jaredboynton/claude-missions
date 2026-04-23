@@ -322,7 +322,9 @@ function validateValidationState(missionName, payload) {
     // A passed assertion without a `proof` block is the bee21e7c failure
     // mode: status seeded from prior-session text instead of a live execute.
     // Warn here so operators notice even if they bypass the critic.
-    if (status === "passed" && (!assertion.proof || !assertion.proof.commitSha)) {
+    // v0.6.0: dropped the commitSha check; proof block must exist with a
+    // toolType + command (the minimum shape recordAssertion now writes).
+    if (status === "passed" && (!assertion.proof || !assertion.proof.toolType || !assertion.proof.command)) {
       metrics.missingProof.push([missionName, assertionId]);
     }
     if (typeof validatedAt === "string") {

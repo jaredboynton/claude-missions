@@ -114,8 +114,9 @@ function scoreFeatureCompletion(feature, workingDir, validationState) {
   if (linkedAssertions.length > 0 && validationState) {
     const assertions = validationState.assertions || {};
     const passedWithProof = linkedAssertions.filter((aid) => {
+      // v0.6.0: proof validity = has toolType + command. commitSha dropped.
       const a = assertions[aid];
-      return a && a.status === "passed" && a.proof && a.proof.commitSha;
+      return a && a.status === "passed" && a.proof && a.proof.toolType && a.proof.command;
     });
     const failedOrStale = linkedAssertions.filter((aid) => {
       const a = assertions[aid];

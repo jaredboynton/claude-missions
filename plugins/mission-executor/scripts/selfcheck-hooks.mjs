@@ -120,20 +120,13 @@ if (!existsSync(manifestPath)) {
 // v0.5.0 assertions (spec §0.5, §6.4, §7.3, §10)
 // ============================================================================
 
-// --- §0.5 probe gate enforcement --------------------------------------------
-//
-// v0.5.1: the §0 Phase-A probe gate was resolved in the 0.5.0 cycle — see
-// PROBE_RESULTS.md. The spec's §0.1 checkboxes remain unchecked because
-// their prose asked "is this tier available?" and the answer is "no" for
-// Tiers 1 and 2 (evidenced in PROBE_RESULTS.md), so the boxes would
-// misrepresent findings if we checked them. The selfcheck gate is now
-// satisfied by PROBE_RESULTS.md existing at the plugin root — the probe
-// artifact is the contract, not the spec checkboxes.
-
-const probeResultsPath = join(PLUGIN_ROOT, "PROBE_RESULTS.md");
-if (!existsSync(probeResultsPath)) {
-  fail("PROBE_RESULTS.md missing. §0 probes must be run and their outputs committed before release. See spec §0.5.");
-}
+// v0.5.1: Phase-A probe gate removed. The probes ran in the 0.5.0 cycle,
+// the findings were absorbed into CHANGELOG.md's 0.5.1 entry under "Probe
+// gates", and the PROBE_RESULTS.md artifact was archived out of tree. The
+// spec's §0.1 checkboxes remain unchecked because the answer for Tiers 1
+// and 2 is "not available in slash-command bash" (evidenced), which is
+// resolved evidence, not unchecked work — the selfcheck no longer gates
+// on the checkbox count. See spec §0 and CHANGELOG.md for the record.
 
 // --- §10 commands/*.md frontmatter + allowed-tools --------------------------
 
@@ -172,7 +165,6 @@ const OMC_STATE_ALLOWLIST = new Set([
   "AGENTS.md",
   "CHANGELOG.md",
   "README.md",
-  "PROBE_RESULTS.md",
 ]);
 const OMC_STATE_DIR_ALLOWLIST = ["tests/"];  // tests legitimately reference the legacy literal
 const MD_DIR_ALLOWLIST = ["skills/", "commands/", "tests/", ".factory/"];

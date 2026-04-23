@@ -48,7 +48,8 @@ function checkCompletion(missionPath) {
       counts.total++;
       const s = a.status || "pending";
       if (s === "passed") {
-        if (!a.proof || !a.proof.commitSha) { counts.proofLess++; proofLessIds.push(id); }
+        // v0.6.0: proof shape is toolType + command + paths (no commitSha).
+        if (!a.proof || !a.proof.toolType || !a.proof.command) { counts.proofLess++; proofLessIds.push(id); }
         else counts.passed++;
       } else if (s === "failed") { counts.failed++; failedIds.push(id); }
       else if (s === "stale") { counts.stale++; staleIds.push(id); }

@@ -2,12 +2,19 @@
 // Two-stage independent critic for mission validation.
 //
 // Stage A (structural): for every `passed` assertion, verify that the proof
-//   block is present, that proof.commitSha is an ancestor of HEAD, and that
-//   recomputed sha256 of stdoutPath/stderrPath matches the recorded hashes.
+//   block is present and that recomputed sha256 of stdoutPath/stderrPath
+//   still matches the recorded hashes (content-integrity check only).
 //
 // Stage B (spot re-execute): sample 20% of passed assertions + 100% of any
-//   literal-probe assertions; re-run via execute-assertion.mjs; any divergence
-//   is a regression.
+//   literal-probe assertions; re-run via execute-assertion.mjs with
+//   CRITIC_SPOT_CHECK=1 so validation-state.json is not mutated; any
+//   divergence is a regression.
+//
+// v0.6.0: dropped the git-ancestry check (proof.commitSha no longer exists).
+// Staleness is now orchestrator-driven: when validation-contract.md changes
+// such that an assertion's criteria change, the orchestrator flips that
+// assertion to `pending`. See AGENTS.md "Staleness model" + the droid
+// upstream convention at organized/uncategorized/0801.js:1649.
 //
 // The critic emits "all validation criteria have been met" ONLY when both
 // stages pass with zero issues. This is the single string the pipeline checks
@@ -20,8 +27,9 @@
 
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { join, resolve, isAbsolute } from "node:path";
-import { execSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { upgradeLegacy052Proofs } from "./_lib/migrate.mjs";
 import { fileURLToPath as _fileURLToPath } from "node:url";
 import { realpathSync as _realpathSync } from "node:fs";
 
@@ -30,30 +38,13 @@ function sha256File(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-// Defect 3 (0.4.7): when a proof was produced inside a meta-repo child
-// (proof.childRepo set), ancestry must be checked against that child's HEAD,
-// not the workspace-root HEAD — they're separate git histories. Fall back
-// to workingDir for legacy proofs and single-repo missions.
-function isAncestor(sha, workingDir, childRepo) {
-  const cwd = childRepo ? resolve(workingDir, childRepo) : workingDir;
-  try {
-    execSync(`git merge-base --is-ancestor ${sha} HEAD`, { cwd, stdio: ["ignore", "pipe", "ignore"] });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function resolveArtifact(artifactPath, missionDir, workingDir) {
+function resolveArtifact(artifactPath, missionDir) {
   if (!artifactPath) return null;
   if (isAbsolute(artifactPath)) return artifactPath;
-  const mp = join(missionDir, artifactPath);
-  if (existsSync(mp)) return mp;
-  const wp = workingDir ? join(workingDir, artifactPath) : null;
-  return wp && existsSync(wp) ? wp : mp;
+  return join(missionDir, artifactPath);
 }
 
-function stageAStructural(missionDir, assertions, workingDir) {
+function stageAStructural(missionDir, assertions) {
   const issues = [];
   const ok = [];
   let checked = 0;
@@ -68,21 +59,17 @@ function stageAStructural(missionDir, assertions, workingDir) {
       continue;
     }
 
-    const required = ["commitSha", "toolType", "command", "exitCode", "stdoutPath", "stderrPath", "touchpoints", "executedAt"];
+    // v0.6.0: commitSha dropped from required fields. childRepo dropped
+    // entirely. The critic no longer consults git history.
+    const required = ["toolType", "command", "exitCode", "stdoutPath", "stderrPath", "touchpoints", "executedAt"];
     const missing = required.filter((k) => proof[k] === undefined || proof[k] === null);
     if (missing.length > 0) {
       issues.push({ id, category: "incomplete-proof", detail: `missing fields: ${missing.join(", ")}` });
       continue;
     }
 
-    if (!isAncestor(proof.commitSha, workingDir, proof.childRepo)) {
-      const scope = proof.childRepo ? `${proof.childRepo} HEAD` : "HEAD";
-      issues.push({ id, category: "stale-commit", detail: `proof.commitSha ${proof.commitSha.slice(0, 12)} not ancestor of ${scope}` });
-      continue;
-    }
-
-    const stdoutAbs = resolveArtifact(proof.stdoutPath, missionDir, workingDir);
-    const stderrAbs = resolveArtifact(proof.stderrPath, missionDir, workingDir);
+    const stdoutAbs = resolveArtifact(proof.stdoutPath, missionDir);
+    const stderrAbs = resolveArtifact(proof.stderrPath, missionDir);
     const stdoutSha = sha256File(stdoutAbs);
     const stderrSha = sha256File(stderrAbs);
 
@@ -101,7 +88,7 @@ function stageAStructural(missionDir, assertions, workingDir) {
   return { checked, ok, issues };
 }
 
-function stageBSpotCheck(missionDir, assertions, workingDir, sampleRate) {
+function stageBSpotCheck(missionDir, assertions, sampleRate) {
   const issues = [];
   const reExecuted = [];
 
@@ -163,11 +150,13 @@ function evaluateMission(missionPath, opts = {}) {
 
   const dir = resolve(missionPath);
   const valStatePath = join(dir, "validation-state.json");
-  const wdPath = join(dir, "working_directory.txt");
   if (!existsSync(valStatePath)) {
     return { verdict: "ERROR", message: "validation-state.json not found", counts: {} };
   }
-  const workingDir = existsSync(wdPath) ? readFileSync(wdPath, "utf8").trim() : process.cwd();
+
+  // One-shot migration of 0.5.x proofs to the 0.6.0 schema + path layout.
+  // Idempotent: no-op once migrated.
+  try { upgradeLegacy052Proofs(missionPath); } catch { /* never fatal */ }
 
   const valState = JSON.parse(readFileSync(valStatePath, "utf8"));
   const assertions = valState.assertions || {};
@@ -200,12 +189,12 @@ function evaluateMission(missionPath, opts = {}) {
   }
 
   // Stage A: structural
-  const stageA = stageAStructural(dir, assertions, workingDir);
+  const stageA = stageAStructural(dir, assertions);
 
   // Stage B: only if A is clean
   let stageB = { reExecuted: [], issues: [] };
   if (!skipStageB && stageA.issues.length === 0) {
-    stageB = stageBSpotCheck(dir, assertions, workingDir, sampleRate);
+    stageB = stageBSpotCheck(dir, assertions, sampleRate);
   }
 
   const allPassed =

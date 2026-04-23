@@ -14,17 +14,21 @@
 //     [--evidence=<str>]
 //
 // Additional flags REQUIRED when --status=passed:
-//     --commit-sha=<40-char HEAD sha>
 //     --tool-type=unit-test|curl|cli-binary|tuistory|literal-probe
 //     --command=<exact command string>
 //     --exit-code=<int>
-//     --stdout-path=<path relative to working-dir or mission-dir>
-//     --stderr-path=<path relative to working-dir or mission-dir>
+//     --stdout-path=<path relative to mission-dir>
+//     --stderr-path=<path relative to mission-dir>
 //     --touchpoints=<comma-separated list of source paths>
 //
 // Optional:
 //     --executor=<script name, default "execute-assertion.mjs">
-//     --working-dir=<path used to resolve stdout/stderr paths>
+//     --working-dir=<path used to resolve stdout/stderr paths — deprecated
+//       in 0.6.0 where paths are missionDir-anchored>
+//
+// v0.6.0: --commit-sha and --child-repo flags are accepted but ignored.
+// The git-ancestry freshness signal was replaced by droid-style
+// orchestrator-driven invalidation (see AGENTS.md).
 
 import { readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
 import { join, resolve, isAbsolute } from "node:path";
@@ -33,7 +37,6 @@ import { fileURLToPath as _fileURLToPath } from "node:url";
 import { realpathSync as _realpathSync } from "node:fs";
 
 const REQUIRED_PROOF_FIELDS_ON_PASS = [
-  "commit-sha",
   "tool-type",
   "command",
   "exit-code",
@@ -83,6 +86,9 @@ function resolveArtifact(pathArg, workingDir, missionPath) {
 }
 
 function buildProof(args, missionPath) {
+  // v0.6.0: proof paths are missionPath-relative. resolveArtifact still
+  // honors --working-dir for back-compat with callers from 0.5.x, but new
+  // writers (execute-assertion.mjs 0.6.0+) pass missionPath-relative paths.
   const workingDir = args["working-dir"] || null;
   const stdoutAbs = resolveArtifact(args["stdout-path"], workingDir, missionPath);
   const stderrAbs = resolveArtifact(args["stderr-path"], workingDir, missionPath);
@@ -94,15 +100,16 @@ function buildProof(args, missionPath) {
     ? args.touchpoints.split(",").map((s) => s.trim()).filter(Boolean)
     : [];
 
-  // Defect 3 (0.4.7): when executeAssertion detects the work lives in a
-  // meta-repo child (via .meta), it passes --child-repo so the critic can
-  // pick the right repo for its ancestry check. Omit the field entirely
-  // for single-repo proofs so we don't bloat the schema when not needed.
-  const childRepo = typeof args["child-repo"] === "string" && args["child-repo"]
-    ? args["child-repo"]
+  // v0.6.0: proof.contractSha256 is the sha256 of the assertion block from
+  // validation-contract.md at the time of execution. invalidate-stale-evidence.mjs
+  // compares this against the current contract hash to detect when the
+  // orchestrator edits the assertion's pass criteria — the droid-style
+  // staleness signal replacing git-ancestry.
+  const contractSha256 = typeof args["contract-sha256"] === "string" && args["contract-sha256"]
+    ? args["contract-sha256"]
     : null;
+
   return {
-    commitSha: args["commit-sha"],
     toolType: args["tool-type"],
     command: args.command,
     exitCode: Number(args["exit-code"]),
@@ -113,7 +120,7 @@ function buildProof(args, missionPath) {
     touchpoints,
     executedAt: new Date().toISOString(),
     executor: args.executor || "execute-assertion.mjs",
-    ...(childRepo ? { childRepo } : {}),
+    ...(contractSha256 ? { contractSha256 } : {}),
   };
 }
 
@@ -123,9 +130,6 @@ function validateProofArgs(args) {
     if (args[flag] === undefined || args[flag] === "" || args[flag] === true) {
       errors.push(`missing required flag --${flag}`);
     }
-  }
-  if (args["commit-sha"] && !/^[0-9a-f]{7,40}$/i.test(args["commit-sha"])) {
-    errors.push(`--commit-sha must be a hex SHA (7-40 chars), got '${args["commit-sha"]}'`);
   }
   if (args["tool-type"] && !ALLOWED_TOOL_TYPES.has(args["tool-type"])) {
     errors.push(`--tool-type must be one of ${[...ALLOWED_TOOL_TYPES].join("|")}, got '${args["tool-type"]}'`);
@@ -207,7 +211,7 @@ if (isMain && process.argv[2]) {
   if (!args.id || !args.status) {
     process.stderr.write(
       "Usage: node record-assertion.mjs <mission-path> --id=VAL-... --status=passed|failed|pending|stale [--evidence=...]\n" +
-      "When --status=passed, also required: --commit-sha --tool-type --command --exit-code --stdout-path --stderr-path --touchpoints\n"
+      "When --status=passed, also required: --tool-type --command --exit-code --stdout-path --stderr-path --touchpoints\n"
     );
     process.exit(1);
   }
