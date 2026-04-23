@@ -70,8 +70,21 @@ function writeStateAtomic(obj) {
 
 // ---- Resolution ----
 
+// Well-known filesystem roots where a bare mission id may live, in
+// precedence order. Keep this tiny — it's the fallback for missions the
+// registry has never seen (e.g. fresh Factory-CLI missions the user just
+// `/execute`s for the first time). Each entry is a directory expected to
+// contain `<id>/` subdirectories.
+function missionSearchRoots() {
+  const roots = [];
+  if (process.env.FACTORY_HOME) roots.push(join(process.env.FACTORY_HOME, "missions"));
+  if (process.env.HOME) roots.push(join(process.env.HOME, ".factory", "missions"));
+  roots.push(join(process.cwd(), ".factory", "missions"));
+  return roots;
+}
+
 // Resolve raw input (path or bare id) to { missionPath, missionId }.
-// Path: realpathSync + basename. Id: registry lookup.
+// Path: realpathSync + basename. Id: registry lookup, then filesystem search.
 function resolveMission(raw) {
   if (!raw || typeof raw !== "string") throw Object.assign(new Error("empty input"), { exitCode: 4 });
 
@@ -84,16 +97,33 @@ function resolveMission(raw) {
     return { missionPath: real, missionId: basename(real) };
   }
 
-  // Bare id: look up in registry
+  // Bare id: look up in registry first (fastest; covers attached/resumable
+  // missions).
   const entry = findMissionById(raw);
-  if (!entry) throw Object.assign(new Error(`unknown mission id: ${raw}`), { exitCode: 3 });
-  // The registry entry stores statePath, not missionPath directly; pull it from state file.
-  try {
-    const st = JSON.parse(readFileSync(entry.statePath, "utf8"));
-    return { missionPath: st.missionPath, missionId: raw };
-  } catch {
-    throw Object.assign(new Error(`registry entry for '${raw}' points at unreadable state`), { exitCode: 3 });
+  if (entry) {
+    // The registry entry stores statePath, not missionPath directly; pull it from state file.
+    try {
+      const st = JSON.parse(readFileSync(entry.statePath, "utf8"));
+      return { missionPath: st.missionPath, missionId: raw };
+    } catch {
+      throw Object.assign(new Error(`registry entry for '${raw}' points at unreadable state`), { exitCode: 3 });
+    }
   }
+
+  // Registry miss: look in the well-known Factory mission roots. This covers
+  // the common path where a user creates a mission via the Factory CLI
+  // (which writes to `~/.factory/missions/<id>/`) and then fires
+  // `/mission-executor:execute <id>` from Claude Code without ever
+  // manually running `start`.
+  for (const root of missionSearchRoots()) {
+    const candidate = join(root, raw);
+    if (existsSync(candidate)) {
+      const real = realpathSync(candidate);
+      return { missionPath: real, missionId: basename(real) };
+    }
+  }
+
+  throw Object.assign(new Error(`unknown mission id: ${raw}`), { exitCode: 3 });
 }
 
 // When called with no mission arg, pick the sole active mission or error.

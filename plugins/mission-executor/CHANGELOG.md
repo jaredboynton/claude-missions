@@ -3,6 +3,43 @@
 All notable changes per release. Dates are the commit date of the version
 bump in [.claude-plugin/plugin.json](.claude-plugin/plugin.json).
 
+## 0.8.3 — 2026-04-23
+
+Immediately after 0.8.2 unblocked argument-forwarding, a second defect
+surfaced on the first real-world run: `/mission-executor:execute
+<uuid>` with a UUID returned `{"ok":false,"error":"unknown mission id:
+<uuid>"}` and exited 3. The mission existed on disk at
+`~/.factory/missions/<uuid>/` — the resolver just never looked there.
+
+### Fixed
+
+- **`resolveMission()` in `scripts/_lib/mission-cli-core.mjs` now falls
+  back to a filesystem search when the registry has no entry for a
+  bare id.** Search order matches Factory-CLI conventions:
+  1. `$FACTORY_HOME/missions/<id>` — honors the upstream Factory env var
+     when set (e.g. CI workspaces that relocate `.factory/`).
+  2. `$HOME/.factory/missions/<id>` — the default Factory CLI location,
+     documented in `~/.factory/AGENTS.md` as the canonical missions root.
+  3. `$CWD/.factory/missions/<id>` — in-repo missions for projects that
+     vendor their Factory workspace.
+
+  The registry lookup still wins when present (zero behavior change for
+  attached / resumable missions). The error path only fires when neither
+  the registry nor any filesystem root contains the id. This closes the
+  gap introduced by the 0.8.0 user-global state migration: the registry
+  is populated by `mission-cli.mjs start`, but a fresh Factory CLI
+  mission has never been `start`-ed, so registry-only resolution
+  returned `exit 3` for every first-time invocation.
+
+### Added
+
+- **Five new cases in `tests/mission-cli.resolve.test.mjs`** covering:
+  (1) `$HOME/.factory/missions/<id>` fallback, (2) `$FACTORY_HOME`
+  precedence over `$HOME`, (3) `$CWD/.factory/missions/<id>` for in-repo
+  missions, (4) registry still wins over filesystem even when a shadow
+  id exists at a fallback root, and (5) exit 3 when an id is absent
+  from both the registry and every fallback root.
+
 ## 0.8.2 — 2026-04-23
 
 One defect surfaced when `/mission-executor:execute <mission-id>` was
