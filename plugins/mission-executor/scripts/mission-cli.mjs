@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 // Dispatcher for mission-cli subcommands. See _lib/mission-cli-core.mjs for
 // shared helpers. See spec sec 4 for the full subcommand contract.
+//
+// v0.5.1: auto-emit progress-log events from lifecycle subcommands + new
+// explicit `event` subcommand. See scripts/_lib/progress-log.mjs.
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -17,6 +20,13 @@ import {
   findMissionById, findMissionForSession, listActive,
 } from "./_lib/registry.mjs";
 import { stateFile, abortFile, stateBase } from "../hooks/_lib/paths.mjs";
+import { appendEvent, readEvents, deriveWorkerStates, activeWorkerSessionIds } from "./_lib/progress-log.mjs";
+
+// Safe wrapper: progress-log writes must NEVER fail a command. Silently swallow.
+function emitEvent(missionPath, type, extra = {}) {
+  if (!missionPath || !type) return;
+  try { appendEvent(missionPath, { type, ...extra }); } catch {}
+}
 
 // Completion gate — re-used from mission-state.mjs pattern in 0.4.x.
 // Inlined here to keep mission-cli free of hook-layer deps.
@@ -136,6 +146,10 @@ async function cmdStart(args) {
       registeredAt: nowIso(),
     });
 
+    emitEvent(mission.missionPath, action === "started" ? "mission_started" : "session_attached", {
+      sessionId: sid, cwd, missionId: mission.missionId,
+    });
+
     emit({ ok: true, action, missionId: mission.missionId, missionPath: mission.missionPath, statePath: stateFile() });
   } catch (e) {
     if (e.code === "LOCK_TIMEOUT") return emit({ ok: false, error: "lock-timeout", detail: e.message }, 6);
@@ -172,6 +186,9 @@ async function cmdAttach(args) {
       current.updatedAt = nowIso();
       return current;
     });
+
+    emitEvent(mission.missionPath, "session_attached", { sessionId: sid, cwd, missionId: mission.missionId });
+
     emit({ ok: true, action: "attached", missionId: mission.missionId, statePath: stateFile() });
   } catch (e) {
     if (e.code === "LOCK_TIMEOUT") return emit({ ok: false, error: "lock-timeout" }, 6);
@@ -186,6 +203,7 @@ async function cmdDetach(args) {
 
   try {
     let result = null;
+    let missionPath = null;
     const next = await mutateState((current) => {
       if (!current || !current.active) {
         const err = new Error("no active mission"); err.exitCode = 3; throw err;
@@ -210,8 +228,12 @@ async function cmdDetach(args) {
       current.attachedSessions.splice(idx, 1);
       current.updatedAt = nowIso();
       result = { remaining: current.attachedSessions.length };
+      missionPath = current.missionPath;
       return current;
     });
+
+    emitEvent(missionPath, "session_detached", { sessionId: sid, remaining: result?.remaining });
+
     emit({ ok: true, action: "detached", ...result });
   } catch (e) {
     if (e.code === "LOCK_TIMEOUT") return emit({ ok: false, error: "lock-timeout" }, 6);
@@ -239,6 +261,18 @@ async function cmdStatus(args) {
   const st = readStateFile();
   if (!st || !st.active) return emit({ ok: true, missionId: mission.missionId, active: false });
   const check = st.missionPath ? checkCompletion(st.missionPath) : { complete: false, reason: "no missionPath in state" };
+
+  // v0.5.1: derive worker state summary from progress_log.jsonl.
+  let workers = null;
+  let activeWorkers = null;
+  if (st.missionPath) {
+    try {
+      const events = readEvents(st.missionPath);
+      workers = deriveWorkerStates(events);
+      activeWorkers = activeWorkerSessionIds(events);
+    } catch {}
+  }
+
   emit({
     ok: true,
     missionId: mission.missionId,
@@ -247,6 +281,7 @@ async function cmdStatus(args) {
     active: st.active,
     attachedSessions: (st.attachedSessions || []).map((s) => ({ sessionId: s.sessionId, role: s.role, cwd: s.cwd })),
     completion: check,
+    ...(workers ? { workers, activeWorkers } : {}),
   });
 }
 
@@ -256,6 +291,8 @@ async function cmdPhase(args) {
   const sid = args["session-id"];
   if (!sid) return emit({ ok: false, error: "missing --session-id" }, 4);
   try {
+    let fromPhase = null;
+    let missionPath = null;
     await mutateState((current) => {
       if (!current || !current.active) {
         const err = new Error("no active mission"); err.exitCode = 3; throw err;
@@ -263,10 +300,15 @@ async function cmdPhase(args) {
       if (!current.attachedSessions?.some((x) => x.sessionId === sid)) {
         const err = new Error("not-attached"); err.exitCode = 3; throw err;
       }
+      fromPhase = current.phase || null;
+      missionPath = current.missionPath;
       current.phase = phaseName;
       current.updatedAt = nowIso();
       return current;
     });
+
+    emitEvent(missionPath, "phase_transition", { sessionId: sid, from: fromPhase, to: phaseName });
+
     emit({ ok: true, phase: phaseName });
   } catch (e) {
     if (e.code === "LOCK_TIMEOUT") return emit({ ok: false, error: "lock-timeout" }, 6);
@@ -281,6 +323,7 @@ async function cmdComplete(args) {
   const force = !!args.force;
   try {
     let missionId = null;
+    let missionPath = null;
     await mutateState((current) => {
       if (!current) { const err = new Error("no active mission"); err.exitCode = 3; throw err; }
       if (!current.attachedSessions?.some((x) => x.sessionId === sid)) {
@@ -299,9 +342,13 @@ async function cmdComplete(args) {
       current.completedAt = nowIso();
       if (force) current.forcedComplete = true;
       missionId = current.missionId;
+      missionPath = current.missionPath;
       return current;
     });
     if (missionId) await unregisterMission(missionId);
+
+    emitEvent(missionPath, "mission_completed", { sessionId: sid, forced: force, missionId });
+
     emit({ ok: true, action: "completed", forced: !!force });
   } catch (e) {
     if (e.code === "LOCK_TIMEOUT") return emit({ ok: false, error: "lock-timeout" }, 6);
@@ -321,6 +368,9 @@ async function cmdAbort(args) {
   }
   ensureDir(stateBase());
   writeFileSync(abortFile(), nowIso() + "\n");
+
+  emitEvent(st.missionPath, "mission_aborted", { sessionId: sid });
+
   emit({ ok: true, action: "abort-marker-dropped", path: abortFile() });
 }
 
@@ -336,6 +386,42 @@ async function cmdIsAttached(args) {
   process.exit(1);
 }
 
+// v0.5.1: explicit event emitter. Used by the skill for worker_started /
+// worker_completed / worker_failed etc. that mission-cli doesn't auto-emit.
+async function cmdEvent(args) {
+  const type = args._[0];
+  if (!type) return emit({ ok: false, error: "bad-input", hint: "usage: event <type> --session-id=<sid> [flags]" }, 4);
+  const sid = args["session-id"];
+  if (!sid) return emit({ ok: false, error: "missing --session-id" }, 4);
+
+  // Resolve mission from the session's attach state. Only attached sessions
+  // can emit — keeps unrelated sessions from polluting the log.
+  const found = findMissionForSession(sid);
+  if (!found) return emit({ ok: false, error: "not-attached" }, 3);
+
+  const missionPath = found.state?.missionPath;
+  if (!missionPath) return emit({ ok: false, error: "no missionPath on state" }, 1);
+
+  const extra = { sessionId: sid };
+  if (args.feature) extra.featureId = args.feature;
+  if (args.worker) extra.workerSessionId = args.worker;
+  if (args.milestone) extra.milestone = args.milestone;
+  if (args.reason) extra.reason = args.reason;
+  if (args["exit-code"] !== undefined) {
+    const n = Number(args["exit-code"]);
+    if (Number.isFinite(n)) extra.exitCode = n;
+  }
+  if (args.spawn) extra.spawnId = args.spawn;
+  if (args["extra-json"]) {
+    try { Object.assign(extra, JSON.parse(args["extra-json"])); }
+    catch (e) { return emit({ ok: false, error: `bad --extra-json: ${e.message}` }, 4); }
+  }
+
+  const r = appendEvent(missionPath, { type, ...extra });
+  if (!r.ok) return emit({ ok: false, error: r.error }, 1);
+  emit({ ok: true, path: r.path, type });
+}
+
 // ---- Main ----
 
 const argv = process.argv.slice(2);
@@ -346,6 +432,7 @@ const table = {
   "resolve": cmdResolve, "start": cmdStart, "attach": cmdAttach, "detach": cmdDetach,
   "status": cmdStatus, "phase": cmdPhase, "complete": cmdComplete, "abort": cmdAbort,
   "is-attached": cmdIsAttached,
+  "event": cmdEvent,
 };
 
 if (sub === "--help" || sub === "-h" || !sub) {

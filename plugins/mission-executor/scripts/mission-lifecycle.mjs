@@ -64,6 +64,7 @@ switch (sub) {
   case "detach":
   case "resolve":
   case "is-attached":
+  case "event":
     passThrough(sub, rest);
     break;
   case "--help":
@@ -71,7 +72,7 @@ switch (sub) {
   case undefined:
     process.stdout.write([
       "mission-lifecycle.mjs <subcommand> [args]  (delegator -> mission-cli.mjs)",
-      "Subcommands: start, phase, complete, abort, status, attach, detach, resolve, is-attached",
+      "Subcommands: start, phase, complete, abort, status, attach, detach, resolve, is-attached, event",
       "All forward to scripts/mission-cli.mjs with equivalent args + auto-resolved --session-id.",
       "See scripts/mission-cli.mjs --help for the authoritative contract.",
     ].join("\n") + "\n");

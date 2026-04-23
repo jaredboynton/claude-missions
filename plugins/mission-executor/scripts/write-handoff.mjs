@@ -1,57 +1,54 @@
 #!/usr/bin/env node
-// write-handoff.mjs — STUB. Contract not yet implemented.
+// Worker-return handoff writer (v0.5.1 — schema-validated).
 //
-// The intended behavior: after a worker Agent() call returns, the orchestrator
-// extracts { whatWasDone, whatWasLeftUndone, discoveredIssues, commitShas,
-// successState, ... } from the worker's return and writes a droid-format
-// handoff JSON to <mission-path>/handoffs/<ts>__<feature-id>__<worker-id>.json.
-// This matches what the droid runtime produces when IT drives the worker loop,
-// so a droid orchestrator's post-mission review finds evidence in the same
-// place regardless of whether Claude Code or droid was the runtime.
+// Replaces the v0.4.x stub with a real implementation backed by
+// scripts/_lib/schemas.mjs (workerHandoffSchema). Writes a droid-compatible
+// JSON file and appends a `handoff_written` event to the mission's
+// progress_log.jsonl.
 //
-// The blocker: Agent() returns unstructured free text. An orchestrator
-// heuristic-parsing worker self-reports is exactly the failure mode that let
-// the last mission mark features complete with no evidence trail. The proper
-// fix is upstream: define a worker-return contract where the worker writes
-// .omc/handoffs-inbox/<worker-id>.json BEFORE shutting down, and the
-// orchestrator reads that rather than parsing stdout.
+// Usage:
+//   node write-handoff.mjs <mission-path> [--handoff-json=<file>] [--force-skip-validation]
+//   echo '<json>' | node write-handoff.mjs <mission-path>
 //
-// Until that contract lands, this script is a stub that exits 2 with a
-// loud message. The orchestrator calling it will see the failure and must
-// either (a) implement the contract or (b) document that Claude Code runtime
-// cannot produce droid-compatible handoffs and operators should use the
-// droid CLI runtime if handoff files are required.
+// Input JSON shape (see scripts/_lib/schemas.mjs > workerHandoffSchema):
+//   {
+//     "workerSessionId":  "sid-worker-1",   (required)
+//     "featureId":        "VAL-X",          (required)
+//     "milestone":        "M1",
+//     "successState":     "success|partial|failure", (required)
+//     "salientSummary":   "20-500 chars, 1-4 sentences",  (required)
+//     "whatWasDone":      ["..."],
+//     "whatWasLeftUndone":["..."],
+//     "discoveredIssues": [{ severity, description, suggestedFix? }],
+//     "commitShas":       ["abc1234"],
+//     "returnToOrchestrator": "...",
+//     "preferredFilePath": "/abs/path/inside/handoffs"     (optional override)
+//   }
 //
-// To unstub:
-//   1. Land a worker-return contract spec (see docs/worker-return-contract.md
-//      -- not yet written).
-//   2. Update workers to write <handoffsInboxDir()>/<worker-id>.json on shutdown
-//      (path resolved via hooks/_lib/paths.mjs — legacy autodetect keeps the
-//      `.omc/handoffs-inbox/` path intact for existing OMC installs).
-//   3. Replace this stub with real read-inbox + write-handoff logic.
+// Output: <missionPath>/handoffs/<ts>__<featureId>__<workerSessionId>.json
+//         (or the preferredFilePath if it's inside the handoffs dir)
+//
+// Emits: `handoff_written` event on the mission's progress_log. The event
+//        carries { featureId, workerSessionId, outPath, unverified? }.
+//
+// Exit codes:
+//   0  success
+//   1  validation failure (schema errors printed as JSON; no file written)
+//   2  bad args (missing mission-path, unreadable --handoff-json, bad JSON)
 
-import { writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { join, resolve, dirname } from "node:path";
+import { writeFileSync, mkdirSync, existsSync, readFileSync } from "node:fs";
+import { join, resolve, isAbsolute, normalize, sep } from "node:path";
+import { validate, workerHandoffSchema } from "./_lib/schemas.mjs";
+import { appendEvent } from "./_lib/progress-log.mjs";
 
-const USAGE = [
-  "STUB: write-handoff.mjs is not yet implemented (plugin v0.4.4).",
-  "",
-  "Intended usage:",
-  "  node write-handoff.mjs <mission-path> --feature=<id> --worker=<session-id> \\",
-  "    --successState=<success|partial|failure> --whatWasDone=<json> \\",
-  "    --commitShas=<json>",
-  "",
-  "Why stub: Agent() returns unstructured text. Heuristic-parsing worker",
-  "self-reports is the failure mode that let prior missions mark features",
-  "complete without evidence. A worker-return contract is required before this",
-  "script can be trusted. See AGENTS.md for current status.",
-  "",
-  "Workarounds:",
-  "  - For now, the orchestrator writes handoff files via an ad-hoc Bash",
-  "    heredoc. Those handoffs are advisory, not proof.",
-  "  - Phase 4 VERIFY (execute-assertion.mjs) is the authoritative path --",
-  "    handoffs are audit evidence, not gate.",
-].join("\n");
+function sanitizeTimestamp(iso) { return iso.replace(/[:.]/g, "-"); }
+function sanitizeFileName(s) {
+  return String(s)
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 120);
+}
 
 function parseArgs(argv) {
   const out = { positional: [], flags: {} };
@@ -68,63 +65,119 @@ function parseArgs(argv) {
   return out;
 }
 
-function main() {
+async function readStdin() {
+  if (process.stdin.isTTY) return "";
+  let input = "";
+  for await (const chunk of process.stdin) input += chunk;
+  return input;
+}
+
+function die(msg, code = 2) {
+  process.stderr.write(msg + "\n");
+  process.exit(code);
+}
+
+async function main() {
   const args = parseArgs(process.argv);
-  const force = args.flags.force === true || args.flags.force === "1";
-
-  // Only proceed in --force mode, which writes a minimal advisory record
-  // that's explicitly marked as unverified. This lets the orchestrator still
-  // produce some handoff audit trail while the real contract is pending.
-  if (!force) {
-    process.stderr.write(USAGE + "\n");
-    process.exit(2);
-  }
-
   const missionPath = args.positional[0];
-  if (!missionPath) {
-    process.stderr.write("missing <mission-path>\n");
-    process.exit(2);
+  if (!missionPath) die("usage: write-handoff.mjs <mission-path> [--handoff-json=<file>]");
+
+  const forceSkip = args.flags["force-skip-validation"] === true || args.flags["force-skip-validation"] === "1";
+
+  // Load JSON: file flag takes precedence over stdin.
+  let raw;
+  if (args.flags["handoff-json"]) {
+    const p = String(args.flags["handoff-json"]);
+    try { raw = readFileSync(p, "utf8"); }
+    catch (e) { die(`--handoff-json: cannot read ${p}: ${e.message}`); }
+  } else {
+    raw = await readStdin();
+    if (!raw || !raw.trim()) {
+      die("no input: pass --handoff-json=<file> or pipe JSON via stdin");
+    }
   }
 
-  const featureId = args.flags.feature;
-  const workerId = args.flags.worker;
-  const successState = args.flags.successState || "partial";
+  let parsed;
+  try { parsed = JSON.parse(raw); }
+  catch (e) { die(`input is not valid JSON: ${e.message}`); }
 
-  if (!featureId || !workerId) {
-    process.stderr.write("--feature=<id> and --worker=<session-id> required under --force\n");
-    process.exit(2);
+  // Validate (unless explicitly bypassed).
+  let unverified = false;
+  if (forceSkip) {
+    unverified = true;
+  } else {
+    const r = validate(workerHandoffSchema, parsed);
+    if (!r.ok) {
+      process.stdout.write(JSON.stringify({ ok: false, errors: r.errors }, null, 2) + "\n");
+      process.exit(1);
+    }
   }
 
-  const handoffDir = join(resolve(missionPath), "handoffs");
-  mkdirSync(handoffDir, { recursive: true });
+  // Resolve mission path; refuse to write outside it.
+  const missionAbs = resolve(missionPath);
+  if (!existsSync(missionAbs)) die(`mission path does not exist: ${missionAbs}`);
 
-  const ts = new Date().toISOString().replace(/[:.]/g, "-");
-  const outPath = join(handoffDir, `${ts}__${featureId}__${workerId}.json`);
+  const handoffsDir = join(missionAbs, "handoffs");
+  mkdirSync(handoffsDir, { recursive: true });
 
-  const body = {
-    _unverified: true,
-    _note: "Written under --force. No worker-return contract yet; this is advisory.",
-    timestamp: new Date().toISOString(),
-    featureId,
-    workerSessionId: workerId,
-    successState,
-    whatWasDone: args.flags.whatWasDone ? tryJSON(args.flags.whatWasDone) : null,
-    whatWasLeftUndone: args.flags.whatWasLeftUndone ? tryJSON(args.flags.whatWasLeftUndone) : null,
-    discoveredIssues: args.flags.discoveredIssues ? tryJSON(args.flags.discoveredIssues) : null,
-    commitShas: args.flags.commitShas ? tryJSON(args.flags.commitShas) : null,
-  };
+  const timestamp = new Date().toISOString();
+  const featureId = parsed.featureId || "unknown-feature";
+  const workerSessionId = parsed.workerSessionId || "unknown-worker";
+  const defaultName = `${sanitizeTimestamp(timestamp)}__${sanitizeFileName(featureId)}__${sanitizeFileName(workerSessionId)}.json`;
+
+  // Honor preferredFilePath only if absolute AND resolves inside the handoffs dir.
+  let outPath;
+  const pref = parsed.preferredFilePath;
+  if (pref && typeof pref === "string" && isAbsolute(pref) && normalize(pref).startsWith(handoffsDir + sep)) {
+    outPath = pref;
+  } else {
+    outPath = join(handoffsDir, defaultName);
+  }
 
   if (existsSync(outPath)) {
-    process.stderr.write(`refusing to overwrite existing handoff: ${outPath}\n`);
-    process.exit(2);
+    die(`refusing to overwrite existing handoff: ${outPath}`);
   }
 
+  // Body mirrors droid's ensureWorkerHandoffJson shape.
+  const body = {
+    timestamp,
+    workerSessionId,
+    featureId,
+    milestone: parsed.milestone ?? null,
+    successState: parsed.successState ?? null,
+    salientSummary: parsed.salientSummary ?? null,
+    whatWasDone: parsed.whatWasDone ?? [],
+    whatWasLeftUndone: parsed.whatWasLeftUndone ?? [],
+    discoveredIssues: parsed.discoveredIssues ?? [],
+    commitShas: parsed.commitShas ?? [],
+    returnToOrchestrator: parsed.returnToOrchestrator ?? null,
+    ...(unverified ? { _unverified: true, _note: "Written with --force-skip-validation; schema not enforced." } : {}),
+  };
+
   writeFileSync(outPath, JSON.stringify(body, null, 2) + "\n");
-  process.stdout.write(JSON.stringify({ ok: true, outPath, unverified: true }) + "\n");
+
+  // Best-effort progress-log entry. Never fail the write because the log append failed.
+  try {
+    appendEvent(missionAbs, {
+      type: "handoff_written",
+      featureId,
+      workerSessionId,
+      outPath,
+      successState: parsed.successState ?? null,
+      ...(unverified ? { unverified: true } : {}),
+    });
+  } catch {}
+
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    outPath,
+    workerSessionId,
+    featureId,
+    ...(unverified ? { unverified: true } : {}),
+  }) + "\n");
 }
 
-function tryJSON(s) {
-  try { return JSON.parse(s); } catch { return s; }
-}
-
-main();
+main().catch((e) => {
+  process.stderr.write(`write-handoff.mjs: ${e.message}\n`);
+  process.exit(2);
+});
