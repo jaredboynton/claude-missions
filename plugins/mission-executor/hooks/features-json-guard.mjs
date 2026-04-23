@@ -11,33 +11,12 @@
 // trivially bypassed. Instead, Bash-level features.json writes are caught
 // after-the-fact by commit-scope-guard inspecting git diffs before commit.
 //
-// SCHEMA: emits both legacy {decision,message} and modern hookSpecificOutput.
+// v0.8.1: emit canonical PreToolUse JSON only (drop legacy `decision`/`message`).
 
 import { audit } from "./_lib/audit.mjs";
+import { preAllow, preDeny } from "./_lib/hook-output.mjs";
 
 const BLOCKED_FILENAME = "features.json";
-
-function denyPayload(reason) {
-  return {
-    decision: "block",
-    message: reason,
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "deny",
-      permissionDecisionReason: reason,
-    },
-  };
-}
-
-function allowPayload() {
-  return {
-    decision: "allow",
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "allow",
-    },
-  };
-}
 
 async function main() {
   let input = "";
@@ -48,7 +27,7 @@ async function main() {
     parsed = JSON.parse(input);
   } catch {
     audit("features-json-guard", { decision: "allow", reason: "unparseable-input" }, { skipIfNoMission: true });
-    process.stdout.write(JSON.stringify(allowPayload()));
+    process.stdout.write(JSON.stringify(preAllow()));
     return;
   }
 
@@ -57,7 +36,7 @@ async function main() {
 
   if (tool_name !== "Write" && tool_name !== "Edit") {
     audit("features-json-guard", { decision: "allow", tool: tool_name, reason: "wrong-tool" }, { skipIfNoMission: true });
-    process.stdout.write(JSON.stringify(allowPayload()));
+    process.stdout.write(JSON.stringify(preAllow()));
     return;
   }
 
@@ -68,7 +47,7 @@ async function main() {
   // requiring the exact basename match.
   if (!/(^|\/)features\.json$/.test(filePath)) {
     audit("features-json-guard", { decision: "allow", tool: tool_name, reason: "wrong-file" }, { skipIfNoMission: true });
-    process.stdout.write(JSON.stringify(allowPayload()));
+    process.stdout.write(JSON.stringify(preAllow()));
     return;
   }
 
@@ -98,11 +77,11 @@ async function main() {
     reason: "direct-write-to-features",
   });
 
-  process.stdout.write(JSON.stringify(denyPayload(reason)));
+  process.stdout.write(JSON.stringify(preDeny(reason)));
 }
 
 main().catch((e) => {
   process.stderr.write(`features-json-guard error: ${e.message}\n`);
   audit("features-json-guard", { decision: "allow", reason: `error:${e.message}` }, { skipIfNoMission: true });
-  process.stdout.write(JSON.stringify(allowPayload()));
+  process.stdout.write(JSON.stringify(preAllow()));
 });

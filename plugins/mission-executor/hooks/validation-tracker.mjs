@@ -4,12 +4,15 @@
 // v0.5.0: gated on session_id membership in state.attachedSessions[]. Also
 // touches the driver heartbeat file so /detach can detect active drivers
 // (spec §4.3 calls for heartbeat touches in both PreToolUse and PostToolUse).
+// v0.8.1: PostToolUse payload replaced `{message}` (schema-invalid) with
+// canonical `hookSpecificOutput.additionalContext` via postContext().
 
 import { appendFileSync, mkdirSync, existsSync, writeFileSync, utimesSync } from "node:fs";
 import { dirname } from "node:path";
 import { loadAttachedMissionState, migrateLegacyAttach } from "./_lib/mission-state.mjs";
 import { claimsLogFile, heartbeatFile, stateBase } from "./_lib/paths.mjs";
 import { audit } from "./_lib/audit.mjs";
+import { postContext, noop } from "./_lib/hook-output.mjs";
 
 const VAL_PATTERN = /\b(VAL-[A-Z]+-\d+[a-z]?)\s*[:|]\s*(PASS|passed|pass|FAIL|failed|fail)\b/gi;
 
@@ -41,7 +44,7 @@ async function main() {
 
   let parsed;
   try { parsed = JSON.parse(input); } catch {
-    process.stdout.write(JSON.stringify({}));
+    process.stdout.write(JSON.stringify(noop()));
     return;
   }
 
@@ -52,7 +55,7 @@ async function main() {
   const { state, reason } = loadAttachedMissionState({ sessionId, cwd });
 
   if (!state || !state.active || !state.missionPath) {
-    process.stdout.write(JSON.stringify({}));
+    process.stdout.write(JSON.stringify(noop()));
     return;
   }
 
@@ -80,7 +83,7 @@ async function main() {
   }
 
   if (claims.length === 0) {
-    process.stdout.write(JSON.stringify({}));
+    process.stdout.write(JSON.stringify(noop()));
     return;
   }
 
@@ -88,12 +91,11 @@ async function main() {
 
   audit("validation-tracker", { decision: "logged", count: claims.length, session_id: sessionId });
 
-  process.stdout.write(JSON.stringify({
-    message: `[worker-claims] Logged ${claims.length} assertion claim(s). These are AUDIT-ONLY. Only execute-assertion.mjs can move status to passed.`,
-  }));
+  const context = `[worker-claims] Logged ${claims.length} assertion claim(s). These are AUDIT-ONLY. Only execute-assertion.mjs can move status to passed.`;
+  process.stdout.write(JSON.stringify(postContext(context)));
 }
 
 main().catch((e) => {
   process.stderr.write(`validation-tracker error: ${e.message}\n`);
-  process.stdout.write(JSON.stringify({}));
+  process.stdout.write(JSON.stringify(noop()));
 });

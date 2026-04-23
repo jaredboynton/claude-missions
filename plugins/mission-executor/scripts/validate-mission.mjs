@@ -60,11 +60,11 @@ function runPythonHarness(harnessRoot, targetMissionId = null) {
   }
 }
 
-// Factory harness rejects any status not in its allow-list. "stale" is a
-// plugin-internal status (see invalidate-stale-evidence.mjs) that maps to
-// `pending` for harness compatibility. Filter those errors out so we
-// don't double-report them as blockers.
-const STALE_STATUS_ERROR_RE = /invalid status 'stale'/;
+// Factory harness rejects any status not in its allow-list. "stale" and
+// "blocked" are plugin-internal statuses that map to `pending` for harness
+// compatibility. Filter those errors out so we don't double-report them
+// as blockers.
+const HARNESS_INTERNAL_STATUS_ERROR_RE = /invalid status '(stale|blocked)'/;
 
 function parseHarnessOutput(text, targetMissionId = null) {
   // When targetMissionId is provided, only report errors/warnings whose
@@ -78,7 +78,7 @@ function parseHarnessOutput(text, targetMissionId = null) {
     const t = line.trim();
     if (t.startsWith("ERROR ")) {
       const msg = t.slice(6);
-      if (STALE_STATUS_ERROR_RE.test(msg)) continue;
+      if (HARNESS_INTERNAL_STATUS_ERROR_RE.test(msg)) continue;
       if (!mentionsTarget(msg)) continue;
       errors.push(msg);
     } else if (t.startsWith("WARN ")) {
@@ -109,6 +109,7 @@ function validateMission(missionPath, options = {}) {
 
   const errors = [...js.errors];
   const warnings = [...js.warnings];
+  const infos = [...(js.infos || [])];
   if (py) {
     for (const e of py.errors) if (!errors.includes(e)) errors.push(e);
     for (const w of py.warnings) if (!warnings.includes(w)) warnings.push(w);
@@ -119,10 +120,10 @@ function validateMission(missionPath, options = {}) {
   return {
     ok,
     passes: {
-      js: { ok: js.ok, errors: js.errors, warnings: js.warnings, metrics: js.metrics },
+      js: { ok: js.ok, errors: js.errors, warnings: js.warnings, infos: js.infos || [], metrics: js.metrics },
       python: py ? { ok: py.ok, errors: py.errors, warnings: py.warnings, available: true } : { available: false },
     },
-    combined: { errors, warnings },
+    combined: { errors, warnings, infos },
     metrics: js.metrics,
   };
 }
@@ -144,6 +145,7 @@ if (isMain && process.argv[2]) {
     }
     for (const e of result.combined.errors) process.stdout.write(`ERROR ${e}\n`);
     for (const w of result.combined.warnings) process.stdout.write(`WARN  ${w}\n`);
+    for (const i of result.combined.infos || []) process.stdout.write(`INFO  ${i}\n`);
   }
 
   process.exit(result.ok ? 0 : 1);

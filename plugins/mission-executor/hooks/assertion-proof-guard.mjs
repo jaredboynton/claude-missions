@@ -14,37 +14,12 @@
 //     the orchestrator invokes record-assertion.mjs AS A SHELL COMMAND
 //     (MISSION_EXECUTOR_WRITER=1 node record-assertion.mjs ...), not hand-edit.
 //
-// SCHEMA: emits both the modern hookSpecificOutput form (Claude Code 2.x) and
-// the legacy top-level {decision,message} form (older Claude Code). New
-// clients honor hookSpecificOutput; older clients fall back to the top-level.
+// v0.8.1: emit canonical PreToolUse JSON only (drop legacy `decision`/`message`).
 
 import { audit } from "./_lib/audit.mjs";
+import { preAllow, preDeny } from "./_lib/hook-output.mjs";
 
 const BLOCKED_FILENAME = "validation-state.json";
-
-function denyPayload(reason) {
-  return {
-    // Legacy schema (deprecated, still honored by older Claude Code)
-    decision: "block",
-    message: reason,
-    // Modern schema (2.x+)
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "deny",
-      permissionDecisionReason: reason,
-    },
-  };
-}
-
-function allowPayload() {
-  return {
-    decision: "allow",
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "allow",
-    },
-  };
-}
 
 async function main() {
   let input = "";
@@ -55,7 +30,7 @@ async function main() {
     parsed = JSON.parse(input);
   } catch {
     audit("assertion-proof-guard", { decision: "allow", reason: "unparseable-input" }, { skipIfNoMission: true });
-    process.stdout.write(JSON.stringify(allowPayload()));
+    process.stdout.write(JSON.stringify(preAllow()));
     return;
   }
 
@@ -64,14 +39,14 @@ async function main() {
 
   if (tool_name !== "Write" && tool_name !== "Edit") {
     audit("assertion-proof-guard", { decision: "allow", tool: tool_name, reason: "wrong-tool" }, { skipIfNoMission: true });
-    process.stdout.write(JSON.stringify(allowPayload()));
+    process.stdout.write(JSON.stringify(preAllow()));
     return;
   }
 
   const filePath = tool_input.file_path || tool_input.path || "";
   if (!filePath.endsWith(BLOCKED_FILENAME)) {
     audit("assertion-proof-guard", { decision: "allow", tool: tool_name, reason: "wrong-file" }, { skipIfNoMission: true });
-    process.stdout.write(JSON.stringify(allowPayload()));
+    process.stdout.write(JSON.stringify(preAllow()));
     return;
   }
 
@@ -97,11 +72,11 @@ async function main() {
     reason: "direct-write-to-validation-state",
   });
 
-  process.stdout.write(JSON.stringify(denyPayload(reason)));
+  process.stdout.write(JSON.stringify(preDeny(reason)));
 }
 
 main().catch((e) => {
   process.stderr.write(`assertion-proof-guard error: ${e.message}\n`);
   audit("assertion-proof-guard", { decision: "allow", reason: `error:${e.message}` }, { skipIfNoMission: true });
-  process.stdout.write(JSON.stringify(allowPayload()));
+  process.stdout.write(JSON.stringify(preAllow()));
 });

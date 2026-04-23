@@ -11,7 +11,7 @@
 //   phase    <phaseName>   --session-id=<id>               0 ok, 3 not-attached, 6 lock-timeout
 //   complete               --session-id=<id> [--force]     0 ok, 8 gate-unmet, 3 not-attached
 //   abort                  --session-id=<id>               0 ok, 3 not-attached
-//   is-attached            --session-id=<id>               0 attached, 1 not-attached
+//   is-attached            --session-id=<id>               0 query-ok (read JSON.attached), 4 bad-input
 //
 // All subcommands print one JSON object to stdout. Stderr carries warnings
 // (stale-lock recovery, GC drops, migration notices).

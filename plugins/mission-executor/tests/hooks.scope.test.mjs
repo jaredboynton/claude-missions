@@ -36,25 +36,35 @@ test("autopilot-lock: missing session_id -> allows (never false-positive)", () =
   } finally { s.cleanup(); }
 });
 
-test("no-ask-during-mission: attached -> blocks AskUserQuestion", () => {
+test("no-ask-during-mission: attached -> blocks AskUserQuestion (canonical 2.1.118 deny)", () => {
+  // v0.8.1: hook now emits `hookSpecificOutput.permissionDecision: "deny"`
+  // instead of legacy top-level `decision: "block"`. Claude Code 2.1.118
+  // rejects the legacy shape with "(root): Invalid input".
   const s = sandbox();
   try {
     runCli(s.env, ["start", s.missionPath, "--session-id=sidA"]);
     const r = runHook(s.env, "no-ask-during-mission.mjs", {
       session_id: "sidA", tool_name: "AskUserQuestion", cwd: s.root,
     });
-    assert.equal(r.out.decision, "block");
+    const spec = r.out.hookSpecificOutput || {};
+    assert.equal(spec.hookEventName, "PreToolUse");
+    assert.equal(spec.permissionDecision, "deny");
+    assert.match(spec.permissionDecisionReason || "", /autopilot-lock/);
+    assert.ok(!("decision" in r.out), "legacy top-level decision must not leak");
   } finally { s.cleanup(); }
 });
 
-test("no-ask-during-mission: unattached -> allows", () => {
+test("no-ask-during-mission: unattached -> allows (canonical 2.1.118 allow)", () => {
   const s = sandbox();
   try {
     runCli(s.env, ["start", s.missionPath, "--session-id=sidA"]);
     const r = runHook(s.env, "no-ask-during-mission.mjs", {
       session_id: "sidOther", tool_name: "AskUserQuestion", cwd: s.root,
     });
-    assert.equal(r.out.decision, "allow");
+    const spec = r.out.hookSpecificOutput || {};
+    assert.equal(spec.hookEventName, "PreToolUse");
+    assert.equal(spec.permissionDecision, "allow");
+    assert.ok(!("decision" in r.out), "legacy top-level decision must not leak");
   } finally { s.cleanup(); }
 });
 

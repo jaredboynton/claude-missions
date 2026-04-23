@@ -385,15 +385,21 @@ async function cmdAbort(args) {
 }
 
 async function cmdIsAttached(args) {
+  // v0.8.1: query-success semantics.
+  //   Missing --session-id        -> ok:false, exit 4  (bad input)
+  //   Session attached to mission -> ok:true, attached:true, missionId, exit 0
+  //   Session not attached        -> ok:true, attached:false, exit 0
+  //
+  // Prior behavior exited 1 for both "no sid" and "not attached", which is
+  // indistinguishable from "lookup threw" and made shell callers (commands/
+  // execute.md bash helpers) unable to branch cleanly. Query-success is
+  // now encoded in the JSON field, not the exit code, mirroring the
+  // shared `emit()` convention used by resolve/start/complete/status/etc.
   const sid = args["session-id"];
-  if (!sid) process.exit(1);
+  if (!sid) return emit({ ok: false, error: "bad-input", hint: "usage: is-attached --session-id=<sid>" }, 4);
   const found = findMissionForSession(sid);
-  if (found) {
-    process.stdout.write(JSON.stringify({ ok: true, attached: true, missionId: found.missionId }) + "\n");
-    process.exit(0);
-  }
-  process.stdout.write(JSON.stringify({ ok: true, attached: false }) + "\n");
-  process.exit(1);
+  if (found) return emit({ ok: true, attached: true, missionId: found.missionId }, 0);
+  return emit({ ok: true, attached: false }, 0);
 }
 
 // v0.5.1: explicit event emitter. Used by the skill for worker_started /

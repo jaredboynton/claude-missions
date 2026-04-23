@@ -20,12 +20,20 @@ this skill directly (without the command firing first), abort and tell the
 user to run the command instead — hooks will no-op for unattached sessions
 and enforcement will silently not fire.
 
-To verify attachment from within the skill:
+To verify attachment from within the skill (v0.8.1 query-success semantics):
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/mission-cli.mjs" is-attached --session-id="<sid>"
+out=$(node "${CLAUDE_PLUGIN_ROOT}/scripts/mission-cli.mjs" is-attached --session-id="<sid>") || {
+  echo "is-attached bad input: $out" >&2; exit 1
+}
+if [ "$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["attached"])')" = "True" ]; then
+  : # attached, continue
+else
+  echo "not attached; run /mission-executor:execute <mission-path>" >&2; exit 1
+fi
 ```
-Exit 0 = attached (continue). Exit 1 = not attached (abort with an error
-message directing the user to run `/mission-executor:execute <mission-path>`).
+Exit 0 always means the query ran; read `.attached` from the JSON to branch.
+Exit 4 means bad input (missing `--session-id`). Prior 0.5–0.8.0 used exit 1
+for both "not attached" and "bad input" — indistinguishable from a crash.
 
 ## Overview
 
@@ -121,9 +129,10 @@ done. The state file (`stateBase()/mission-executor-state.json`) is already
 written with `active=true` and this session is already in `attachedSessions[]`.
 
 The Stop hook reads that state file and refuses to let the assistant end its
-turn until completion criteria are met. If `is-attached` returns exit 1 at
-any point during the pipeline, something removed this session from the
-mission's scope — abort with a clear error.
+turn until completion criteria are met. If `is-attached` returns JSON with
+`attached: false` at any point during the pipeline, something removed this
+session from the mission's scope — abort with a clear error. (Exit 4 from
+`is-attached` means bad input, not "not attached" — handle it separately.)
 
 Phase transitions: as the pipeline advances phase, record the transition:
 ```bash

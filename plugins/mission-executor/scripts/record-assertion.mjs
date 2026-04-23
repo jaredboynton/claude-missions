@@ -10,7 +10,7 @@
 // Usage:
 //   node record-assertion.mjs <mission-path>
 //     --id=VAL-XXX-NNN
-//     --status=passed|failed|pending|stale
+//     --status=passed|failed|pending|stale|blocked
 //     [--evidence=<str>]
 //
 // Additional flags REQUIRED when --status=passed:
@@ -210,7 +210,7 @@ if (isMain && process.argv[2]) {
   );
   if (!args.id || !args.status) {
     process.stderr.write(
-      "Usage: node record-assertion.mjs <mission-path> --id=VAL-... --status=passed|failed|pending|stale [--evidence=...]\n" +
+      "Usage: node record-assertion.mjs <mission-path> --id=VAL-... --status=passed|failed|pending|stale|blocked [--evidence=...]\n" +
       "When --status=passed, also required: --tool-type --command --exit-code --stdout-path --stderr-path --touchpoints\n"
     );
     process.exit(1);

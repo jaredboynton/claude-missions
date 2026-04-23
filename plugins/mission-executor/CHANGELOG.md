@@ -3,6 +3,137 @@
 All notable changes per release. Dates are the commit date of the version
 bump in [.claude-plugin/plugin.json](.claude-plugin/plugin.json).
 
+## 0.8.1 — 2026-04-22
+
+Five defects surfaced by a live `/mission-executor:mission-execute` run
+on mission `038bc065-1446-4538-a1e9-72067ba03d60`:
+
+  - D1: every PreToolUse hook tripped Claude Code 2.1.118 JSON-schema
+    validation ("(root): Invalid input") on every tool call, because the
+    hooks emitted hybrid legacy (`decision`/`message`) + modern
+    (`hookSpecificOutput.permissionDecision`) payloads. Two PostToolUse
+    hooks emitted a bare `{message: ...}` which is also not in the 2.1.118
+    PostToolUse schema.
+  - D2: critic Stage B's spawned `execute-assertion.mjs --id=...` under
+    `CRITIC_SPOT_CHECK=1` still called `writeProofBundle` BEFORE the
+    early-return gate, so `stdout.txt` / `stderr.txt` / `meta.json` under
+    `<missionDir>/validation/proofs/<id>/` were overwritten. Stage A on
+    the next run then observed a hash-mismatch and flipped previously-
+    passed assertions. Defect 2 from 0.4.7 was partially closed (no more
+    validation-state.json mutations) but the proof-bundle side-effect
+    was still open.
+  - D3: 18 assertions blocked because `dispatchShellGeneric.tryExtract`
+    returned null on narrative evidence ("confirm that `<literal>` is
+    printed in `<path>`") with no backticked runnable command.
+  - D4: `validate-schema.mjs > summarize()` emitted one cross-mission
+    roll-up per warning category ("0 across 1 mission(s); examples: ...")
+    that lost per-entry triage detail.
+  - D5: `mission-cli.mjs is-attached` exited 1 for both "no sid" and
+    "not attached", indistinguishable from a crash. Callers in
+    `skills/mission-execute/SKILL.md` could not branch cleanly.
+
+### Changed
+
+- **All 8 mission-executor hooks now emit Claude Code 2.1.118-compliant
+  JSON** via a new shared helper `hooks/_lib/hook-output.mjs`. PreToolUse
+  hooks (`commit-scope-guard`, `worker-boundary-enforcer`,
+  `assertion-proof-guard`, `features-json-guard`, `no-ask-during-mission`)
+  use canonical `hookSpecificOutput.permissionDecision` +
+  `permissionDecisionReason`. PostToolUse hooks (`validation-tracker`,
+  `build-discipline`) use `hookSpecificOutput.additionalContext` instead
+  of the schema-invalid top-level `{message}`. Stop's
+  `{decision: "block", reason}` (autopilot-lock.mjs) remains legal per
+  the 2.1.118 docs and is unchanged.
+- **`critic-evaluator.mjs > stageBSpotCheck` now calls
+  `executeAssertionReadOnly()` in-process** instead of spawning
+  `node execute-assertion.mjs` with `CRITIC_SPOT_CHECK=1`. The read-only
+  variant sets the env var for the duration of the call and restores
+  the prior value on exit, so the gate inside
+  `executeAssertion()` takes the early-return path BEFORE
+  `writeProofBundle` — no proof artifacts are rewritten. Prior spawn-based
+  path remains valid as a CLI entry but is no longer used by the critic.
+- **`executeAssertion()` gate reordered**: the `CRITIC_SPOT_CHECK === "1"`
+  early-return now fires BEFORE `writeProofBundle`. Previously it fired
+  AFTER the write, so Stage B's re-exec overwrote the mission-phase
+  proof bundle even though `validation-state.json` was spared. Stage A's
+  next hash check then flipped the assertion.
+- **`validate-schema.mjs > summarize()` emits one message per entry**
+  rather than a cross-mission roll-up. Per-entry shape is
+  `missions/<name>/<id> <label>[ -- <note>]`. Given the plugin always
+  scopes validation to one mission, the "across N mission(s)" fan-out
+  was pure noise.
+- **Warnings bucket split into `warnings` (trust-affecting) and
+  `infos` (bookkeeping)** in `validate-schema.mjs`. `missingProof`,
+  `unknownMilestones`, and completion-state divergence stay in
+  `warnings`. `missingValidatedAtMilestone`, orphan assertions,
+  unresolved session refs, and missing `completedWorkerSessionId` move
+  to `infos`. Both buckets render in CLI output (`INFO  <msg>` line)
+  but only `warnings` flip exit code under `--strict`.
+- **`mission-cli.mjs is-attached` returns query-success exit codes**:
+  exit 0 always when the query succeeds (read `.attached` from the JSON
+  to branch), exit 4 on bad input (missing `--session-id`). Previously
+  both "no sid" and "not attached" exited 1, indistinguishable from a
+  crash.
+
+### Added
+
+- **`hooks/_lib/hook-output.mjs`**: five helpers — `preAllow({context})`,
+  `preDeny(reason)`, `postContext(context)`, `stopBlock(reason)`,
+  `noop()` — that produce the canonical 2.1.118 JSON shape for each
+  hook event. Hooks now `import { preAllow, preDeny } from
+  "./_lib/hook-output.mjs"` instead of constructing payloads by hand.
+- **`executeAssertionReadOnly(missionPath, opts)`** named export in
+  `scripts/execute-assertion.mjs`. Wraps `executeAssertion()` with
+  `CRITIC_SPOT_CHECK=1` set for the duration and restored on exit.
+  Intended ONLY for the critic; the CLI entry still uses
+  `executeAssertion()` for normal validation.
+- **Evidence recognizer #6 — `recognizeAssertionLiteral`** in
+  `scripts/_lib/evidence-recognizers.mjs`. Rescues narrative evidence
+  shapes like "confirm that \`<literal>\` is printed in \`<path>\`" /
+  "output should contain \`<literal>\`" / "\`<path>\` includes
+  \`<literal>\`" by emitting `grep -Fq -- '<literal>' <path>`.
+  Disjoint from recognizers 1-5: does NOT fire when any backticked
+  block looks runnable or when negation prose is present. Runs last in
+  the priority dispatcher so structural recognizers win.
+- **`"blocked"` as a first-class assertion status** in
+  `validate-schema.mjs > ALLOWED_ASSERTION_STATUSES` and
+  `record-assertion.mjs`. When `dispatchShellGeneric` returns
+  `status: "blocked"` (narrative-only assertion with no runnable plan),
+  `execute-assertion.mjs` now records the status with evidence
+  "blocked (dispatcher): ..." so operators see it in
+  `validation-state.json` instead of finding the assertion silently
+  pending forever. `critic-evaluator.mjs` already counted `blocked` as
+  a non-failing pending reason — verdict remains `INCOMPLETE`, not
+  `FAIL`, when the mission's only non-pass assertions are blocked.
+- **Factory-harness filter now covers `blocked` too**: the
+  `HARNESS_INTERNAL_STATUS_ERROR_RE` in `validate-mission.mjs` drops
+  `invalid status 'stale'` OR `invalid status 'blocked'` errors
+  emitted by the Python harness that doesn't know about these
+  plugin-internal values.
+
+### Fixed
+
+- **D1 — PreToolUse/PostToolUse hook JSON validation failures** on
+  every Bash/Edit/Write/AskUserQuestion tool call. The Claude Code
+  2.1.118 schema rejects hybrid legacy+modern shapes; emitting
+  `{decision: "allow", hookSpecificOutput: {...}}` in the same payload
+  fails with "(root): Invalid input". All hooks now emit the canonical
+  shape via `hooks/_lib/hook-output.mjs`.
+- **D2 — Critic Stage B idempotency: proof-bundle overwrite closed.**
+  Stage B re-exec no longer overwrites `stdout.txt` / `stderr.txt` /
+  `meta.json`; Stage A's hash check on the next run is stable across
+  repeated critic invocations.
+- **D3 — Narrative assertions no longer blocked.** `recognizeAssertionLiteral`
+  rescues positive-presence prose shapes; unrecoverable narrative
+  assertions are now recorded with status `blocked` and show up in
+  `validation-state.json` for operator review.
+- **D4 — validate-schema warnings are per-entry and bucketed.** The
+  cross-mission roll-up ("N across 1 mission(s)") is gone; each
+  warning/info now names its `missions/<name>/<id>` subject.
+- **D5 — is-attached queries are distinguishable from crashes.** Exit 0
+  for query success, exit 4 for bad input; shell callers branch on the
+  JSON, not the exit code.
+
 ## 0.8.0 — 2026-04-22
 
 Project-scoped state relocates from the working directory to the user

@@ -3,31 +3,11 @@
 // session is attached to an active mission.
 //
 // v0.5.0: gated on session_id membership in state.attachedSessions[].
+// v0.8.1: emit canonical PreToolUse JSON only (drop legacy `decision`/`message`).
 
 import { loadAttachedMissionState, suggestNextAction, migrateLegacyAttach } from "./_lib/mission-state.mjs";
 import { audit } from "./_lib/audit.mjs";
-
-function denyPayload(reason) {
-  return {
-    decision: "block",
-    message: reason,
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "deny",
-      permissionDecisionReason: reason,
-    },
-  };
-}
-
-function allowPayload() {
-  return {
-    decision: "allow",
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "allow",
-    },
-  };
-}
+import { preAllow, preDeny } from "./_lib/hook-output.mjs";
 
 async function main() {
   let input = "";
@@ -36,13 +16,13 @@ async function main() {
   let parsed;
   try { parsed = JSON.parse(input); } catch {
     audit("no-ask-during-mission", { decision: "allow", reason: "unparseable-input" });
-    process.stdout.write(JSON.stringify(allowPayload()));
+    process.stdout.write(JSON.stringify(preAllow()));
     return;
   }
 
   if (parsed.tool_name !== "AskUserQuestion") {
     audit("no-ask-during-mission", { decision: "allow", tool: parsed.tool_name, reason: "wrong-tool" });
-    process.stdout.write(JSON.stringify(allowPayload()));
+    process.stdout.write(JSON.stringify(preAllow()));
     return;
   }
 
@@ -52,7 +32,7 @@ async function main() {
 
   if (!state || !state.active) {
     audit("no-ask-during-mission", { decision: "allow", reason: reason || "no-active-mission", session_id: sessionId });
-    process.stdout.write(JSON.stringify(allowPayload()));
+    process.stdout.write(JSON.stringify(preAllow()));
     return;
   }
 
@@ -82,11 +62,11 @@ async function main() {
   ].join("\n");
 
   audit("no-ask-during-mission", { decision: "deny", missionPath: state.missionPath, phase: state.phase, session_id: sessionId });
-  process.stdout.write(JSON.stringify(denyPayload(reasonText)));
+  process.stdout.write(JSON.stringify(preDeny(reasonText)));
 }
 
 main().catch((e) => {
   process.stderr.write(`no-ask-during-mission error: ${e.message}\n`);
   audit("no-ask-during-mission", { decision: "allow", reason: `error:${e.message}` });
-  process.stdout.write(JSON.stringify(allowPayload()));
+  process.stdout.write(JSON.stringify(preAllow()));
 });

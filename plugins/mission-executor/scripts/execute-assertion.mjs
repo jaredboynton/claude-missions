@@ -1160,11 +1160,27 @@ function executeAssertion(missionPath, opts = {}) {
     result = runOne(tool);
   }
 
-  // Infra / blocked: do not mark passed, do not even write a proof bundle.
+  // Infra: do not touch validation-state.json at all. Infra failures are
+  // operator-actionable (missing binary, unset env) and should not be
+  // recorded as a validation outcome.
   if (result.status === "infra") {
     return { ok: false, id, status: "infra", message: result.message, exitCode: 3 };
   }
+
+  // Blocked: assertion is narrative-only and no recognizer could produce a
+  // runnable plan. v0.8.1 records the status (with the dispatcher message
+  // as evidence) so validate-schema/validate-mission can report it
+  // directly instead of leaving the assertion silently pending forever.
+  // record-assertion's non-passed branch deletes any stale proof block,
+  // so this write is idempotent across runs. Read-only gated like the
+  // passed path so Stage B doesn't mutate state.
   if (result.status === "blocked") {
+    if (process.env.CRITIC_SPOT_CHECK === "1") {
+      return { ok: false, id, status: "blocked", message: result.message, exitCode: 2, spotCheckOnly: true };
+    }
+    process.env.MISSION_EXECUTOR_WRITER = "1";
+    const evBlocked = `blocked (dispatcher): ${result.message || "no runnable command"}`;
+    try { recordAssertion(dir, { id, status: "blocked", evidence: evBlocked }); } catch {}
     return { ok: false, id, status: "blocked", message: result.message, exitCode: 2 };
   }
 
@@ -1182,18 +1198,17 @@ function executeAssertion(missionPath, opts = {}) {
   if (touchpoints.length === 0) {
     touchpoints = [`assertion:${id}:tool=${result.toolType}`];
   }
-  const { stdoutPath, stderrPath } = writeProofBundle(dir, id, result);
 
-  // Defect 2 (0.4.7): when the critic's Stage B spot-checks a passed
-  // assertion by spawning this script with CRITIC_SPOT_CHECK=1, we compute
-  // the verdict and proof bundle but MUST NOT touch validation-state.json.
-  // Writing here would flip a previously-passed assertion to failed whenever
-  // the re-exec happens to produce exit != 0 (common for evidence that the
-  // dispatcher parses differently than the original record path), causing
-  // idempotency loss across successive critic runs.
+  // Defect 2 (0.4.7, hardened 0.8.1): when the critic's Stage B spot-checks
+  // a passed assertion, we must compute the verdict WITHOUT mutating any
+  // proof artifacts or validation-state.json. Writing the proof bundle here
+  // would overwrite the original mission-phase stdout/stderr/meta; Stage A
+  // on the next run would then observe a hash-mismatch and flip previously-
+  // passed assertions to failed.
   //
-  // The proof bundle under <missionDir>/validation/proofs/<id>/ is still
-  // written: idempotent side output, useful for operator diagnosis.
+  // Gate BEFORE writeProofBundle so the side-effect-free read path is
+  // truly read-only. Stage B still gets the verdict + expected/observed
+  // string so the critic can compare against the recorded claim.
   if (process.env.CRITIC_SPOT_CHECK === "1") {
     return {
       ok: true,
@@ -1202,10 +1217,16 @@ function executeAssertion(missionPath, opts = {}) {
       toolType: result.toolType,
       exitCode: result.status === "passed" ? 0 : 1,
       expected: result.expected,
-      observed: { exitCode: result.exitCode, stdoutPath, stderrPath },
+      observed: {
+        exitCode: result.exitCode,
+        stdout: result.stdout ?? "",
+        stderr: result.stderr ?? "",
+      },
       spotCheckOnly: true,
     };
   }
+
+  const { stdoutPath, stderrPath } = writeProofBundle(dir, id, result);
 
   // Authorize the proof write via env var that assertion-proof-guard hook checks.
   process.env.MISSION_EXECUTOR_WRITER = "1";
@@ -1276,4 +1297,22 @@ if (isMain && process.argv[2]) {
   process.exit(result.exitCode ?? (result.ok ? 0 : 1));
 }
 
-export { executeAssertion };
+// In-process, read-only variant for the critic's Stage B spot-check.
+// Sets CRITIC_SPOT_CHECK=1 for the duration of the call so the
+// side-effect gate inside executeAssertion() takes the early-return path
+// (no writeProofBundle, no recordAssertion, no validation-state.json
+// mutation). Restores the prior env value on exit, including propagation
+// of thrown errors. Callers get the same shape as executeAssertion with
+// `spotCheckOnly: true` set.
+function executeAssertionReadOnly(missionPath, opts = {}) {
+  const prev = process.env.CRITIC_SPOT_CHECK;
+  process.env.CRITIC_SPOT_CHECK = "1";
+  try {
+    return executeAssertion(missionPath, opts);
+  } finally {
+    if (prev === undefined) delete process.env.CRITIC_SPOT_CHECK;
+    else process.env.CRITIC_SPOT_CHECK = prev;
+  }
+}
+
+export { executeAssertion, executeAssertionReadOnly };

@@ -12,6 +12,7 @@ import {
   recognizeListAnchor,
   recognizeAlternation,
   recognizeNegationList,
+  recognizeAssertionLiteral,
   recognizeEvidencePlan,
 } from "../scripts/_lib/evidence-recognizers.mjs";
 
@@ -212,6 +213,83 @@ test("negation-list: no negation prose -> no match", () => {
 });
 
 // ---------------------------------------------------------------------------
+// recognizeAssertionLiteral (v0.8.1 — recognizer #6)
+// ---------------------------------------------------------------------------
+
+test("assertion-literal: 'confirm `literal` is printed in `path.ts`' matches", () => {
+  const ev = "confirm that `onboarding_step_completed` is printed in `src/events.ts`";
+  const plan = recognizeAssertionLiteral(ev, "");
+  assert.equal(plan?.kind, "assertion-literal");
+  assert.equal(plan?.commands.length, 1);
+  assert.match(plan.commands[0], /^grep -Fq -- 'onboarding_step_completed' src\/events\.ts$/);
+});
+
+test("assertion-literal: 'output contains `LITERAL` in `file.md`' matches", () => {
+  const ev = "output contains `CF_API_TOKEN_MISSING` in `src/errors.md`";
+  const plan = recognizeAssertionLiteral(ev, "");
+  assert.equal(plan?.kind, "assertion-literal");
+  assert.match(plan.commands[0], /^grep -Fq -- 'CF_API_TOKEN_MISSING' src\/errors\.md$/);
+});
+
+test("assertion-literal: '`path` includes `literal`' matches", () => {
+  const ev = "`.github/workflows/ci.yml` includes `runs-on: ubuntu-22.04`";
+  const plan = recognizeAssertionLiteral(ev, "");
+  assert.equal(plan?.kind, "assertion-literal");
+  assert.match(plan.commands[0], /grep -Fq -- 'runs-on: ubuntu-22\.04' \.github\/workflows\/ci\.yml$/);
+});
+
+test("assertion-literal: runnable command present -> defer (return null)", () => {
+  // If a backtick block looks runnable, recognizers 1-5 or the basic
+  // tryExtract take priority. assertion-literal must not fire.
+  const ev = "confirm that `grep -q foo src/x.ts` exits 0";
+  const plan = recognizeAssertionLiteral(ev, "");
+  assert.equal(plan, null);
+});
+
+test("assertion-literal: negation prose -> null (avoid false positive)", () => {
+  // "absent from" / "must not contain" -> negative. Positive grep would
+  // falsely pass when the literal IS present.
+  const ev = "confirm that `PROD_SECRET` is absent from `src/config.ts`";
+  const plan = recognizeAssertionLiteral(ev, "");
+  assert.equal(plan, null);
+});
+
+test("assertion-literal: no positive-presence verb -> null", () => {
+  // No "contains/includes/prints/emits/..." signal.
+  const ev = "the `LITERAL` exists alongside `src/x.ts`";
+  const plan = recognizeAssertionLiteral(ev, "");
+  assert.equal(plan, null);
+});
+
+test("assertion-literal: missing path hint -> null", () => {
+  const ev = "confirm that `onboarding_step_completed` is printed";
+  const plan = recognizeAssertionLiteral(ev, "");
+  assert.equal(plan, null);
+});
+
+test("assertion-literal: missing literal (only path) -> null", () => {
+  // Single backtick block that is a path; nothing to search for.
+  const ev = "includes `src/events.ts`";
+  const plan = recognizeAssertionLiteral(ev, "");
+  assert.equal(plan, null);
+});
+
+test("assertion-literal: single-char/digit literal rejected", () => {
+  // A single-char / pure-digit literal would match too broadly.
+  const ev = "confirm that `1` is printed in `src/x.ts`";
+  assert.equal(recognizeAssertionLiteral(ev, ""), null);
+  const ev2 = "confirm that `a` is printed in `src/x.ts`";
+  assert.equal(recognizeAssertionLiteral(ev2, ""), null);
+});
+
+test("assertion-literal: prose-only path hint 'in foo/bar.ts' works", () => {
+  const ev = "includes `EMITTED_EVENT` in src/events.ts";
+  const plan = recognizeAssertionLiteral(ev, "");
+  assert.equal(plan?.kind, "assertion-literal");
+  assert.match(plan.commands[0], /src\/events\.ts$/);
+});
+
+// ---------------------------------------------------------------------------
 // recognizeEvidencePlan priority dispatcher
 // ---------------------------------------------------------------------------
 
@@ -235,6 +313,20 @@ test("priority: plain single-command evidence returns null (falls through to try
   const ev = "`grep -q foo file.txt`";
   const plan = recognizeEvidencePlan(ev, "");
   assert.equal(plan, null, "single-command evidence is tryExtract's territory");
+});
+
+test("priority: structural recognizers beat assertion-literal for overlapping evidence", () => {
+  // Compound-AND evidence that ALSO has positive-presence prose. compound-and
+  // must win since it runs before assertion-literal in the dispatcher.
+  const ev = "`grep -q foo f1` AND `grep -q bar f2` — confirm both are printed";
+  const plan = recognizeEvidencePlan(ev, "");
+  assert.equal(plan?.kind, "compound-and");
+});
+
+test("priority: assertion-literal rescues narrative evidence that was previously blocked", () => {
+  const ev = "confirm that `mission_completed` is printed in `src/events.ts`";
+  const plan = recognizeEvidencePlan(ev, "");
+  assert.equal(plan?.kind, "assertion-literal");
 });
 
 test("priority: narrative prose with no structural signals returns null", () => {

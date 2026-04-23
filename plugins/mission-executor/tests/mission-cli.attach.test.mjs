@@ -62,12 +62,32 @@ test("start without --session-id fails with exit 4", () => {
   } finally { s.cleanup(); }
 });
 
-test("is-attached: exit 0 when in attachedSessions, exit 1 otherwise", () => {
+test("is-attached: query-success exit 0 with JSON.attached distinguishing state (0.8.1)", () => {
   const s = sandbox();
   try {
     runCli(s.env, ["start", s.missionPath, "--session-id=sidA"]);
-    assert.equal(runCli(s.env, ["is-attached", "--session-id=sidA"]).code, 0);
-    assert.equal(runCli(s.env, ["is-attached", "--session-id=sidNope"]).code, 1);
+
+    // Attached: exit 0, JSON.attached=true, missionId set.
+    const hit = runCli(s.env, ["is-attached", "--session-id=sidA"]);
+    assert.equal(hit.code, 0);
+    const hitJson = JSON.parse(hit.stdout);
+    assert.equal(hitJson.ok, true);
+    assert.equal(hitJson.attached, true);
+    assert.ok(typeof hitJson.missionId === "string" && hitJson.missionId.length > 0);
+
+    // Not attached: still exit 0 (query succeeded), JSON.attached=false.
+    const miss = runCli(s.env, ["is-attached", "--session-id=sidNope"]);
+    assert.equal(miss.code, 0);
+    const missJson = JSON.parse(miss.stdout);
+    assert.equal(missJson.ok, true);
+    assert.equal(missJson.attached, false);
+
+    // Bad input: exit 4, ok:false.
+    const bad = runCli(s.env, ["is-attached"]);
+    assert.equal(bad.code, 4);
+    const badJson = JSON.parse(bad.stdout);
+    assert.equal(badJson.ok, false);
+    assert.equal(badJson.error, "bad-input");
   } finally { s.cleanup(); }
 });
 

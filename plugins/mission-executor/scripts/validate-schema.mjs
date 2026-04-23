@@ -24,10 +24,17 @@ import { realpathSync as _realpathSync } from "node:fs";
 
 const ALLOWED_MISSION_STATES = new Set(["completed", "orchestrator_turn", "paused", "running"]);
 const ALLOWED_FEATURE_STATUSES = new Set(["cancelled", "completed", "in_progress", "pending"]);
-// "stale" is an internal status used by invalidate-stale-evidence.mjs when a
-// proof's commitSha drifts past HEAD. Treat it as pending for Factory harness
-// compatibility but accept it as a valid value here.
-const ALLOWED_ASSERTION_STATUSES = new Set(["failed", "passed", "pending", "stale"]);
+// Internal-only statuses: both map to pending for Factory harness
+// compatibility (see STALE_STATUS_ERROR_RE / BLOCKED_STATUS_ERROR_RE in
+// validate-mission.mjs) but are first-class values here:
+//   - "stale"   invalidate-stale-evidence.mjs: proof's contract hash
+//               drifted past the current validation-contract.md text.
+//   - "blocked" execute-assertion.mjs: dispatcher returned status=blocked
+//               because the evidence was narrative-only and no recognizer
+//               produced a runnable plan. Recorded (v0.8.1+) so downstream
+//               validators report it clearly instead of leaving the
+//               assertion silently pending forever.
+const ALLOWED_ASSERTION_STATUSES = new Set(["failed", "passed", "pending", "stale", "blocked"]);
 
 const STATE_REQUIRED_KEYS = [
   "missionId",
@@ -334,13 +341,27 @@ function validateValidationState(missionName, payload) {
   return { errors, metrics };
 }
 
+// v0.8.1: emit per-entry lines instead of a single "N across M mission(s)"
+// roll-up. This scope runs inside a single mission (validate-mission.mjs
+// scoped the harness call with targetMissionId), so the cross-mission
+// pluralization ("across N mission(s)") always said "across 1 mission(s)"
+// -- pure noise that crowded out real signal. Per-entry output lets the
+// operator triage warnings one-by-one and keeps the CI-friendly format
+// (one emitted warning per concrete issue).
+//
+// Each entry is an Array whose non-null components are joined with "/".
+// Typical shapes:
+//   [missionName, assertionId]             -> "missions/<name>/<id> <label>"
+//   [missionName, assertionId, milestone]  -> "missions/<name>/<id> <label> (<milestone>)"
+//   [missionName, featureOrAssertionId]    -> "missions/<name>/<id> <label>"
 function summarize(label, entries, note) {
   if (!entries.length) return [];
-  const missionCount = new Set(entries.map((e) => e[0])).size;
-  const examples = entries.slice(0, 5).map((e) => e.filter((p) => p != null).join("/")).join(", ");
-  let msg = `${entries.length} ${label} across ${missionCount} mission(s); examples: ${examples}`;
-  if (note) msg += `. ${note}`;
-  return [msg];
+  const suffix = note ? ` -- ${note}` : "";
+  return entries.map((e) => {
+    const parts = (Array.isArray(e) ? e : [e]).filter((p) => p != null && p !== "");
+    const qualifier = parts.length > 0 ? `missions/${parts.join("/")} ` : "";
+    return `${qualifier}${label}${suffix}`;
+  });
 }
 
 function validateMissionSchema(missionPath) {
@@ -423,18 +444,33 @@ function validateMissionSchema(missionPath) {
     errors.push(...validateModelSettings(missionName, modelSettings));
   }
 
-  warnings.push(...summarize("passed assertions are missing validatedAtMilestone", assertionMetrics.missingValidatedAt));
-  warnings.push(...summarize("passed assertions are missing a `proof` block (not execute-assertion.mjs output)", assertionMetrics.missingProof, "these passes are not trusted by the two-stage critic"));
-  warnings.push(...summarize("assertions reference milestones not present in mission features", unknownMilestones));
-  warnings.push(...summarize("completed features with workerSessionIds lack a non-null completedWorkerSessionId", featureMetrics.missingCompletedRefs));
-  warnings.push(...summarize("assertions are not fulfilled by any feature", orphanEntries));
+  // v0.8.1: bucket by severity.
+  //   warnings -- real signal, operator should investigate before completion
+  //   infos    -- cosmetic drift / bookkeeping gaps that don't compromise
+  //              evidence integrity (proof-bearing assertions or completion
+  //              correctness). Still surfaced so nothing is silently hidden.
+  //
+  // Routing rationale:
+  //   - missingValidatedAt / orphanEntries / unresolvedSessionRefs /
+  //     missingCompletedRefs are metadata gaps; they don't affect whether
+  //     recorded proofs are trustworthy.
+  //   - missingProof / unknownMilestones / divergence ARE trust signals:
+  //     the proof block is the integrity handle (bee21e7c regression); a
+  //     feature/mission-state mismatch flags a sync bug somewhere.
+  const infos = [];
+  warnings.push(...summarize("passed assertion missing a `proof` block (not execute-assertion.mjs output)", assertionMetrics.missingProof, "not trusted by the two-stage critic"));
+  warnings.push(...summarize("assertion references a milestone not present in mission features", unknownMilestones));
   warnings.push(...summarize("mission completion state diverges from feature completion", divergence));
-  warnings.push(...summarize("worker session references do not resolve in sessions-index.json", featureMetrics.unresolvedSessionRefs, "warning only until session retention policy is defined"));
+  infos.push(...summarize("passed assertion missing validatedAtMilestone", assertionMetrics.missingValidatedAt));
+  infos.push(...summarize("completed feature with workerSessionIds lacks a non-null completedWorkerSessionId", featureMetrics.missingCompletedRefs));
+  infos.push(...summarize("assertion is not fulfilled by any feature (orphan)", orphanEntries));
+  infos.push(...summarize("worker session reference does not resolve in sessions-index.json", featureMetrics.unresolvedSessionRefs, "info only until session retention policy is defined"));
 
   return {
     ok: errors.length === 0,
     errors,
     warnings,
+    infos,
     metrics: {
       missionName,
       missionState,

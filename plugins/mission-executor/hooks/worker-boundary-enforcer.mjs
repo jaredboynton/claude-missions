@@ -4,12 +4,14 @@
 // file so /detach can tell whether this session is actively driving.
 //
 // v0.5.0: gated on session_id membership in state.attachedSessions[].
+// v0.8.1: emit canonical PreToolUse JSON via hooks/_lib/hook-output.mjs.
 
 import { readFileSync, existsSync, writeFileSync, mkdirSync, utimesSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { loadAttachedMissionState, checkCompletion, migrateLegacyAttach } from "./_lib/mission-state.mjs";
 import { audit } from "./_lib/audit.mjs";
 import { heartbeatFile, stateBase } from "./_lib/paths.mjs";
+import { preAllow, preDeny } from "./_lib/hook-output.mjs";
 
 function touchHeartbeat(sessionId) {
   if (!sessionId) return;
@@ -77,25 +79,6 @@ function isMissionProgressTool(tool_name, tool_input) {
   );
 }
 
-function denyPayload(reason) {
-  return {
-    decision: "block", message: reason,
-    hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason },
-  };
-}
-
-function allowPayload(additionalContext = null) {
-  const out = {
-    decision: "allow",
-    hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
-  };
-  if (additionalContext) {
-    out.hookSpecificOutput.additionalContext = additionalContext;
-    out.systemMessage = additionalContext;
-  }
-  return out;
-}
-
 async function main() {
   let input = "";
   for await (const chunk of process.stdin) input += chunk;
@@ -103,7 +86,7 @@ async function main() {
   let parsed;
   try { parsed = JSON.parse(input); } catch {
     audit("worker-boundary-enforcer", { decision: "allow", reason: "unparseable-input" }, { skipIfNoMission: true });
-    process.stdout.write(JSON.stringify(allowPayload()));
+    process.stdout.write(JSON.stringify(preAllow()));
     return;
   }
 
@@ -115,7 +98,7 @@ async function main() {
 
   if (!state || !state.active || !state.missionPath) {
     audit("worker-boundary-enforcer", { decision: "allow", tool: tool_name, reason: reason || "no-active-mission", session_id: sessionId }, { skipIfNoMission: true });
-    process.stdout.write(JSON.stringify(allowPayload()));
+    process.stdout.write(JSON.stringify(preAllow()));
     return;
   }
 
@@ -136,7 +119,7 @@ async function main() {
   }
   if (blockMsg) {
     audit("worker-boundary-enforcer", { decision: "deny", tool: tool_name, missionPath: state.missionPath, reason: blockMsg, session_id: sessionId });
-    process.stdout.write(JSON.stringify(denyPayload(blockMsg)));
+    process.stdout.write(JSON.stringify(preDeny(blockMsg)));
     return;
   }
 
@@ -160,11 +143,11 @@ async function main() {
     decision: "allow", tool: tool_name, missionPath: state.missionPath,
     injectedContext: !!additionalContext, session_id: sessionId,
   });
-  process.stdout.write(JSON.stringify(allowPayload(additionalContext)));
+  process.stdout.write(JSON.stringify(preAllow({ context: additionalContext })));
 }
 
 main().catch((e) => {
   process.stderr.write(`worker-boundary-enforcer error: ${e.message}\n`);
   audit("worker-boundary-enforcer", { decision: "allow", reason: `error:${e.message}` }, { skipIfNoMission: true });
-  process.stdout.write(JSON.stringify({ decision: "allow" }));
+  process.stdout.write(JSON.stringify(preAllow()));
 });

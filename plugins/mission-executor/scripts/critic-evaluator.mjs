@@ -27,9 +27,9 @@
 
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { join, resolve, isAbsolute } from "node:path";
-import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { upgradeLegacy052Proofs } from "./_lib/migrate.mjs";
+import { executeAssertionReadOnly } from "./execute-assertion.mjs";
 import { fileURLToPath as _fileURLToPath } from "node:url";
 import { realpathSync as _realpathSync } from "node:fs";
 
@@ -105,39 +105,32 @@ function stageBSpotCheck(missionDir, assertions, sampleRate) {
   const shuffled = [...passedIds].sort(() => Math.random() - 0.5);
   const sample = new Set([...shuffled.slice(0, sampleCount), ...literalProbeIds]);
 
-  const executeScript = join(resolve(new URL(import.meta.url).pathname, ".."), "execute-assertion.mjs");
-
   for (const id of sample) {
     reExecuted.push(id);
-    // CRITIC_SPOT_CHECK=1 tells execute-assertion.mjs to compute the verdict
-    // and proof bundle but NOT write to validation-state.json — critic
-    // verification is a read, not a mutation. Without this flag, a re-exec
-    // that produces a different verdict than the original pass downgrades
-    // the assertion, breaking critic idempotency (defect 2 in 0.4.6).
-    // MISSION_EXECUTOR_WRITER stays set for belt-and-suspenders: if any
-    // future path needs the gate it remains honored.
-    const env = {
-      ...process.env,
-      MISSION_EXECUTOR_WRITER: "1",
-      CRITIC_SPOT_CHECK: "1",
-    };
-    const r = spawnSync("node", [executeScript, missionDir, `--id=${id}`], {
-      encoding: "utf8",
-      env,
-      maxBuffer: 16 * 1024 * 1024,
-    });
-    // execute-assertion exit: 0=passed, 1=failed, 2=blocked, 3=infra
-    if (r.status === 0) continue;
-    if (r.status === 2 || r.status === 3) {
-      // Blocked or infra-limited: do not count as regression (stage B is best-effort).
+    // v0.8.1: call executeAssertionReadOnly() in-process instead of
+    // spawning node on execute-assertion.mjs. The read-only variant sets
+    // CRITIC_SPOT_CHECK=1 for the duration of the call, which makes the
+    // gate in executeAssertion() return BEFORE writeProofBundle — so no
+    // stdout.txt / stderr.txt / meta.json under
+    // <missionDir>/validation/proofs/<id>/ is rewritten by the critic.
+    // Prior implementation spawned node and depended on CRITIC_SPOT_CHECK
+    // env propagation; the gate also fired AFTER writeProofBundle, so the
+    // proofs were overwritten even though validation-state.json was spared.
+    // Stage A on the next run then observed a hash-mismatch and flipped
+    // the assertion -- defect 2 (0.4.7) re-opened and now fully closed.
+    let result;
+    try {
+      result = executeAssertionReadOnly(missionDir, { id });
+    } catch (e) {
+      issues.push({ id, category: "re-execute-divergence", detail: `critic re-exec threw: ${e.message}` });
       continue;
     }
-    // Failed re-execution = regression.
-    let detail = "re-execute failed";
-    try {
-      const out = JSON.parse(r.stdout);
-      detail = `re-execute failed: expected=${out.expected || "?"} observed exit=${out.observed?.exitCode ?? r.status}`;
-    } catch {}
+    // Verdict shape matches the prior spawnSync contract:
+    //   status "passed" -> pass; "blocked"/"infra" -> best-effort skip;
+    //   "failed" or anything else -> regression.
+    if (result.status === "passed") continue;
+    if (result.status === "blocked" || result.status === "infra") continue;
+    const detail = `re-execute failed: expected=${result.expected || "?"} observed exit=${result.observed?.exitCode ?? "?"}`;
     issues.push({ id, category: "re-execute-divergence", detail });
   }
 

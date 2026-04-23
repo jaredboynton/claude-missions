@@ -3,9 +3,12 @@
 // build command before committing.
 //
 // v0.5.0: gated on session_id membership in state.attachedSessions[].
+// v0.8.1: PostToolUse payload replaced `{message}` (schema-invalid) with
+// canonical `hookSpecificOutput.additionalContext` via postContext().
 
 import { loadAttachedMissionState, migrateLegacyAttach } from "./_lib/mission-state.mjs";
 import { audit } from "./_lib/audit.mjs";
+import { postContext, noop } from "./_lib/hook-output.mjs";
 
 async function main() {
   let input = "";
@@ -13,7 +16,7 @@ async function main() {
 
   let parsed;
   try { parsed = JSON.parse(input); } catch {
-    process.stdout.write(JSON.stringify({}));
+    process.stdout.write(JSON.stringify(noop()));
     return;
   }
 
@@ -24,7 +27,7 @@ async function main() {
   const { state, reason } = loadAttachedMissionState({ sessionId, cwd });
 
   if (!state || !state.active) {
-    process.stdout.write(JSON.stringify({}));
+    process.stdout.write(JSON.stringify(noop()));
     return;
   }
 
@@ -33,7 +36,7 @@ async function main() {
   }
 
   if (tool_name !== "Edit" && tool_name !== "Write") {
-    process.stdout.write(JSON.stringify({}));
+    process.stdout.write(JSON.stringify(noop()));
     return;
   }
 
@@ -43,15 +46,14 @@ async function main() {
 
   if (isSrcFile && state.buildCommand) {
     audit("build-discipline", { decision: "remind", tool: tool_name, session_id: sessionId });
-    process.stdout.write(JSON.stringify({
-      message: `[Build Discipline] Source file modified: ${filePath}. Run \`${state.buildCommand}\` before committing.`,
-    }));
+    const context = `[Build Discipline] Source file modified: ${filePath}. Run \`${state.buildCommand}\` before committing.`;
+    process.stdout.write(JSON.stringify(postContext(context)));
   } else {
-    process.stdout.write(JSON.stringify({}));
+    process.stdout.write(JSON.stringify(noop()));
   }
 }
 
 main().catch((e) => {
   process.stderr.write(`build-discipline error: ${e.message}\n`);
-  process.stdout.write(JSON.stringify({}));
+  process.stdout.write(JSON.stringify(noop()));
 });

@@ -318,6 +318,101 @@ function extractGrepPathHint(evidence, body) {
 }
 
 // ---------------------------------------------------------------------------
+// Recognizer 6: assertion-literal
+//
+// Narrative evidence of the form "confirm that `<literal>` is printed in
+// `<path>`" where neither backticked span is a runnable command. Previously
+// `dispatchShellGeneric.tryExtract` rejected these outright because every
+// backtick block failed EXEC_PREFIX_RE, yielding status=blocked. v0.8.1
+// rescues them: if prose contains a positive-presence predicate (contains,
+// includes, prints, emits, shows, displays, printed, output, produces) AND
+// the evidence has a backticked literal AND a backticked path (or a prose
+// "in | within | at PATH" hint), emit a single grep/rg command that
+// searches for the literal in the target.
+//
+// Example evidence shapes rescued:
+//   Evidence: confirm that `onboarding_step_completed` is printed in `src/events.ts`
+//   Evidence: output contains `CF_API_TOKEN_MISSING` in `src/errors.md`
+//   Evidence: `.github/workflows/ci.yml` includes `runs-on: ubuntu-22.04`
+//
+// Disjoint from recognizers 1-5: does NOT fire when any runnable command
+// block is present in the evidence (those take priority). Does NOT fire on
+// negation predicates ("absent", "no", "must not") — those already route
+// through recognizer 5 (negation-list) when the shape matches, and letting
+// this one handle them would emit a positive grep that falsely passes when
+// the literal IS present.
+// ---------------------------------------------------------------------------
+
+const POS_PRESENCE_RE = /\b(contains?|includes?|prints?|printed|emits?|emitted|shows?|displays?|produces?|outputs?|logs?|matches?|has)\b/i;
+const ANY_NEGATION_RE = /\b(absent|must\s+not|no\s+occurrences?|zero\s+occurrences?|does\s+not\s+(?:contain|match)|not\s+(?:printed|present|contain))\b/i;
+
+// Accept any file path ending with a recognized extension. Mirrors the
+// list in dispatchLiteralProbe's path-hint regex, with additions for
+// workflow/config surfaces common in mission contracts.
+const LITERAL_PATH_RE = /^[\w./-]+\.(?:ts|tsx|js|jsx|py|go|rs|sql|md|yml|yaml|json|toml|ini|sh|bash|mjs|cjs|html|css|conf|cfg)$/;
+
+function looksLikeRunnable(block) {
+  const t = block.trim();
+  return EXEC_PREFIX_RE.test(t) && !NOT_RUNNABLE.test(t) && !hasPlaceholder(t);
+}
+
+export function recognizeAssertionLiteral(evidence, body) {
+  const searchText = (body || "") + "\n" + (evidence || "");
+  if (!POS_PRESENCE_RE.test(searchText)) return null;
+  if (ANY_NEGATION_RE.test(searchText)) return null;
+
+  // If any backticked block looks runnable, defer to the basic extractor
+  // or to recognizers 1-5. This keeps behavior unchanged for evidence that
+  // already has a grep/rg/aws command in it.
+  for (const source of [evidence, body]) {
+    if (!source) continue;
+    for (const m of backtickBlocks(source)) {
+      if (looksLikeRunnable(m[1])) return null;
+    }
+  }
+
+  // Collect backticked candidates: paths vs literals.
+  let path = null;
+  let literal = null;
+  for (const source of [evidence, body]) {
+    if (!source) continue;
+    for (const m of backtickBlocks(source)) {
+      const t = m[1].trim();
+      if (!t) continue;
+      if (!path && LITERAL_PATH_RE.test(t)) { path = t; continue; }
+      // Literal candidate: the first non-path backtick block. Narrative
+      // contracts sometimes backtick paths twice (`src/a.ts` then
+      // `src/a.ts` again) — skip any repeat that matches the chosen path.
+      if (!literal && t !== path) literal = t;
+    }
+  }
+
+  // Prose path fallback: "in|within|at `foo/bar.ts`" or bare "in foo/bar.ts".
+  if (!path) {
+    const prose = searchText.match(/\b(?:in|within|at|from|inside)\s+`([^`]+)`/)
+      || searchText.match(/\b(?:in|within|at|from|inside)\s+([\w./-]+\.[A-Za-z0-9]{1,6})/);
+    if (prose && LITERAL_PATH_RE.test(prose[1])) path = prose[1];
+  }
+
+  if (!path || !literal) return null;
+  // Literal must be substantive. Reject single-char / whitespace / pure-
+  // digit / empty literals that would grep-match anything.
+  if (literal.length < 2) return null;
+  if (/^\d+$/.test(literal)) return null;
+
+  const escaped = literal.replace(/'/g, "'\\''");
+  // Use grep -F (fixed-string) for predictability; -q for exit code only.
+  // Prefer rg if the original literal contains ripgrep-safe patterns, but
+  // keep the implementation simple: grep -F is universally available.
+  const commands = [`grep -Fq -- '${escaped}' ${path}`];
+  return {
+    kind: "assertion-literal",
+    commands,
+    origSource: `grep -Fq -- '${literal}' ${path}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Priority dispatcher
 //
 // Order rationale:
@@ -328,6 +423,9 @@ function extractGrepPathHint(evidence, body) {
 //   4. alternation-grep — fires only with negation prose + `|` syntax
 //   5. negation-list — fallback identifier-list case; fires only with
 //      negation prose AND identifier-shape tokens (disjoint from list-anchor)
+//   6. assertion-literal — narrative positive-presence shapes that 1-5 miss;
+//      runs last so any structural recognizer wins priority (the narrative
+//      shape is intentionally the least specific match)
 // ---------------------------------------------------------------------------
 
 const RECOGNIZERS = [
@@ -336,6 +434,7 @@ const RECOGNIZERS = [
   recognizeListAnchor,
   recognizeAlternation,
   recognizeNegationList,
+  recognizeAssertionLiteral,
 ];
 
 export function recognizeEvidencePlan(evidence, body) {
