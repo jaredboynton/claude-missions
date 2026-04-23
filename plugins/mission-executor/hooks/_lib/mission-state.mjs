@@ -218,13 +218,19 @@ function isRegistered(missionId, missionPath) {
 // will hit the primary path). Append-if-absent semantics mean concurrent
 // migrations with distinct session-ids all land in attachedSessions[].
 //
+// v0.5.1: on successful migration, emits a `legacy_migration_completed` event
+// to the mission's progress log. This is the ONE place hooks (transitively)
+// write to progress_log — isolated to the migration writer; all other hooks
+// stay on hook-audit.log.
+//
 // Returns: { migrated: bool, skipped: bool, reason? }
 export async function migrateLegacyAttach({ sessionId, cwd } = {}) {
   if (!sessionId) return { migrated: false, skipped: true, reason: "no-session-id" };
   const { withLock } = await import("../../scripts/_lib/lockfile.mjs");
   const p = stateFile();
+  let migratedMissionPath = null;
   try {
-    return await withLock(stateLockFile(), () => {
+    const outcome = await withLock(stateLockFile(), () => {
       if (!existsSync(p)) return { migrated: false, skipped: true, reason: "no-state" };
       const s = JSON.parse(readFileSync(p, "utf8"));
       s.attachedSessions = s.attachedSessions || [];
@@ -243,8 +249,24 @@ export async function migrateLegacyAttach({ sessionId, cwd } = {}) {
       mkdirSync(dirname(p), { recursive: true });
       writeFileSync(tmp, JSON.stringify(s, null, 2) + "\n");
       renameSync(tmp, p);
+      migratedMissionPath = s.missionPath || null;
       return { migrated: true, skipped: false };
     }, { deadlineMs: 1000 });
+
+    // Emit after lock released (progress_log has its own append-atomic semantics).
+    if (outcome.migrated && migratedMissionPath) {
+      try {
+        const { appendEvent } = await import("../../scripts/_lib/progress-log.mjs");
+        appendEvent(migratedMissionPath, {
+          type: "legacy_migration_completed",
+          sessionId,
+          cwd: cwd || process.cwd(),
+        });
+      } catch {
+        // Progress-log write is best-effort; never fail the migration.
+      }
+    }
+    return outcome;
   } catch (e) {
     if (e.code === "LOCK_TIMEOUT") return { migrated: false, skipped: true, reason: "lock-timeout" };
     return { migrated: false, skipped: true, reason: `error:${e.message}` };

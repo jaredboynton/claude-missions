@@ -80,6 +80,12 @@ export function proofsDir(id)      { return join(validationDir(), "proofs", id);
 export function claimsLogFile()    { return join(validationDir(), "worker-claims.jsonl"); }
 export function handoffsInboxDir() { return join(layoutRoot(), "handoffs-inbox"); }
 export function workerSkillsDir()  { return join(layoutRoot(), "skills"); }
+
+// v0.5.1: per-mission event stream. Lives next to state.json / features.json /
+// validation-state.json INSIDE the mission directory (not under layoutRoot),
+// matching droid's MissionFileService location so dual-runtime workflows can
+// share the file.
+export function progressLogFile(missionPath) { return join(missionPath, "progress_log.jsonl"); }
 export function registryFile()     { return join(process.env.HOME || "/tmp", ".claude/mission-executor/registry.json"); }
 export function registryLockFile() { return registryFile() + ".lock"; }
 
