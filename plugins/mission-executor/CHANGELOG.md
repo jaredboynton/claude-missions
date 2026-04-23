@@ -3,6 +3,81 @@
 All notable changes per release. Dates are the commit date of the version
 bump in [.claude-plugin/plugin.json](.claude-plugin/plugin.json).
 
+## 0.6.0 — 2026-04-22
+
+Droid alignment: pure-droid staleness model, mission-centric proof
+storage, single-repo-per-mission assumption. Meta-repo machinery deleted;
+the problem class goes away by architecture rather than helpers.
+
+### Changed
+
+- **Proof bundles move to missionDir**: proofs now land at
+  `<missionPath>/validation/proofs/<id>/{stdout.txt,stderr.txt,meta.json}`
+  (was `<workingDir>/.mission-executor/validation/proofs/<id>/` in 0.5.x).
+  Stored paths in `validation-state.json` are missionPath-relative, so
+  missions remain portable if the directory moves. Matches droid's
+  `MissionFileService` layout at `organized/core-services/0806.js`.
+- **Staleness is contract-driven, not git-driven**.
+  `invalidate-stale-evidence.mjs` rewritten as a contract-change detector:
+  compares each passed assertion's `proof.contractSha256` against the
+  current assertion block in `validation-contract.md`. Drift = stale.
+  Force-push, rebase, branch-switch no longer auto-invalidate proofs.
+  Matches droid's orchestrator-driven invalidation at
+  `organized/uncategorized/0801.js:1649`.
+- **Critic Stage A simplified**: no more `git merge-base --is-ancestor`
+  call. Stage A verifies proof block present + content-integrity hashes.
+  `critic-evaluator.mjs` imports `spawnSync` only (no `execSync`).
+
+### Added
+
+- `scripts/_lib/mission-paths.mjs` — mission-scoped path helpers
+  (`proofsDir(missionPath, id)`, `validationDir(missionPath)`,
+  `handoffsDir(missionPath)`, `progressLogPath(missionPath)`,
+  `workingDirectoryPath(missionPath)`, plus feature/state/contract paths).
+  Pure functions of `missionPath` — never consult `layoutRoot()`.
+- `scripts/_lib/migrate.mjs > upgradeLegacy052Proofs(missionPath)` —
+  one-shot transparent migration. Runs at top of `executeAssertion` and
+  `evaluateMission`. Strips `commitSha`/`childRepo`, moves proof bundles
+  from legacy paths into `<missionPath>/validation/proofs/`, rewrites
+  stored paths to missionPath-relative. Idempotent.
+- `proof.contractSha256` — new field, sha256 of the assertion's block in
+  `validation-contract.md` at execution time. Staleness signal.
+- Tests: `tests/mission-paths.test.mjs` (11 assertions on the helper
+  module), `tests/invalidate-stale-evidence.test.mjs` (7 tests covering
+  contract drift, contract deletion, legacy fallback, dry-run),
+  `tests/upgrade-legacy-052-proofs.test.mjs` (6 migration scenarios
+  including OMC legacy + missing bundle files), and
+  `tests/single-repo-assumption.test.mjs` (structural invariants pinning
+  that mission-executor scripts never import meta-repo or run
+  `git merge-base`).
+
+### Removed
+
+- `scripts/_lib/meta-repo.mjs` — deleted. Cross-repo proof-tagging was
+  0.5.1's fix for the meta-repo staleness problem; 0.6.0 eliminates the
+  problem entirely by dropping git ancestry.
+- `tests/cross-repo-head.test.mjs` — deleted. All 6 scenarios
+  (child-repo routing, prefix-collision, missing-meta, invalidate-
+  respects-childRepo) are structurally impossible in the 0.6.0 model.
+- `proof.commitSha` — no longer written, no longer required. Legacy
+  proofs are rewritten on first touch via migration.
+- `proof.childRepo` — no longer written. Never part of the public
+  schema outside 0.5.1; removed for consistency.
+- `--commit-sha` flag on `record-assertion.mjs` — still accepted for
+  back-compat (silently ignored); explicitly no longer required.
+
+### Migration notes
+
+- Legacy 0.5.x missions load transparently. First run emits a single
+  stderr line per mission: `mission-executor: upgraded N 0.5.x proof(s)
+  to 0.6.0 schema`. No operator action required.
+- Missions whose proof bundle files are missing on disk (force-push
+  dropped them, workingDir wiped) flip affected assertions to
+  `status: pending` — the next `execute-assertion` run regenerates.
+- Operators relying on "force-push invalidates the validation pile" must
+  now manually flip affected assertions to `pending`, or edit the
+  contract to trigger hash drift.
+
 ## 0.5.1 — 2026-04-22
 
 Two features on top of the 0.5.0 command surface: mission-scoped progress
@@ -83,13 +158,29 @@ explicitly deferred.
 - **`skills/mission-status/SKILL.md`** notes the `workers` /
   `activeWorkers` additions to the status JSON.
 
-### Probe gates (see `PROBE_RESULTS.md`)
+### Probe gates
 
-- §0.1 Phase-A probe gate in `scripts/selfcheck-hooks.mjs` is satisfied by
-  `PROBE_RESULTS.md` existing at the plugin root; the selfcheck no longer
-  greps the spec's §0 checkboxes. Rationale: the probe artifact is the
-  evidentiary contract — evidence that tiers 1/2 are NOT available in
-  slash-command bash is still "resolved evidence," not "unchecked work."
+- §0.1 Phase-A probes ran in-session on 2026-04-22 against Claude Code
+  2.1.117 (AWS Bedrock). Definitive findings:
+  - Tier 1 env (`$CLAUDE_SESSION_ID` / `$CLAUDE_CODE_SESSION_ID`) —
+    **NOT SET** in slash-command bash. Claude Code 2.1.117 does not inject.
+  - Tier 2 stdin JSON — **NOT RECEIVED** in slash-command bash.
+  - Tier 3a per-session file (`<sessionIdDir>/<sid>.active`) — **CONFIRMED**
+    post-restart; SessionStart hook writes it.
+  - Tier 3b jsonl filename (`~/.claude/projects/<slug>/<sid>.jsonl`) —
+    **CONFIRMED**; load-bearing for slash-command bash.
+  - §0.4 (`~/.claude/mission-executor/` ownership) — **CLEAR**. No conflict.
+  - §0.3 (`disable-model-invocation` frontmatter) — **DEFERRED**. Not probe-
+    verifiable. `commands/status.md` ships both the frontmatter key AND a
+    prose deterrent, so correctness does not depend on the key being honored.
+- `scripts/selfcheck-hooks.mjs` dropped the §0 probe-gate assertion. The
+  PROBE_RESULTS.md artifact was archived out of tree once findings landed
+  in this changelog entry.
+- Non-blocking followups from the probe run: (A) scope Tier 3b glob to the
+  `$PWD`-derived slug to avoid cross-project jsonl collisions under parallel
+  sessions; (B) teach `resolve-sid.sh` a `${HOME}/.claude/mission-executor/
+  state/sessions/` hardcoded fallback so slash-command bash can use Tier 3a
+  without `CLAUDE_PLUGIN_ROOT`.
 
 ### Tests
 
