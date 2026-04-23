@@ -3,6 +3,38 @@
 All notable changes per release. Dates are the commit date of the version
 bump in [.claude-plugin/plugin.json](.claude-plugin/plugin.json).
 
+## 0.8.2 — 2026-04-23
+
+One defect surfaced when `/mission-executor:execute <mission-id>` was
+invoked on Claude Code 2.1.19+: the slash command fired
+`mission-cli.mjs start "" --session-id=...` and exited `bad-input`
+before the mission could register.
+
+### Fixed
+
+- **`commands/execute.md` and `commands/status.md` now forward the user
+  argument via `"$ARGUMENTS"` instead of `"$1"`**. Claude Code 2.1.19
+  (CHANGELOG: "Added shorthand `$0`, `$1`, etc. for accessing individual
+  arguments in custom commands") made positional placeholders 0-indexed,
+  so `$0` is the first argument and `$1` is the *second*. mission-executor
+  commands take a single optional positional (mission path or id), so
+  every invocation sent `$1 = ""` into `mission-cli.mjs start`, which
+  returned `{ok: false, error: "bad-input", hint: "usage: start
+  <mission-path>"}` and short-circuited the pipeline. `$ARGUMENTS` (the
+  full raw argument string) is the canonical single-arg form and matches
+  the other plugin commands in the cache. Thin quoting (`"$ARGUMENTS"`)
+  preserves paths with spaces; command semantics are otherwise unchanged.
+
+### Added
+
+- **`tests/commands-arg-shape.test.mjs`** freezes the argument-shape
+  contract for `commands/execute.md`, `commands/status.md`,
+  `commands/abort.md`, and `commands/detach.md`. Argument-forwarding
+  commands must pass `"$ARGUMENTS"` and must not contain
+  `$0`..`$3`; no-arg commands must contain neither. This regression
+  guard catches both the original 0.5.0–0.8.1 mistake and the
+  mirror-image trap of introducing `$0` when upstream later renumbers.
+
 ## 0.8.1 — 2026-04-22
 
 Five defects surfaced by a live `/mission-executor:mission-execute` run
