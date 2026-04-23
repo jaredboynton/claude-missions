@@ -21,6 +21,7 @@ import {
 } from "./_lib/registry.mjs";
 import { stateFile, abortFile, stateBase } from "../hooks/_lib/paths.mjs";
 import { appendEvent, readEvents, deriveWorkerStates, activeWorkerSessionIds } from "./_lib/progress-log.mjs";
+import { migrateProjectStateToUserGlobal } from "./_lib/migrate.mjs";
 
 // Safe wrapper: progress-log writes must NEVER fail a command. Silently swallow.
 function emitEvent(missionPath, type, extra = {}) {
@@ -92,6 +93,10 @@ async function cmdStart(args) {
   const sid = args["session-id"];
   if (!sid) return emit({ ok: false, error: "missing --session-id" }, 4);
 
+  // v0.8.0: lift any pre-existing project-scoped state out of the workingDir
+  // before resolving state paths. Never fatal.
+  try { migrateProjectStateToUserGlobal(args.cwd || process.cwd()); } catch {}
+
   let mission;
   try { mission = resolveMission(raw); }
   catch (e) { return emit({ ok: false, error: e.message }, e.exitCode || 3); }
@@ -161,6 +166,10 @@ async function cmdStart(args) {
 async function cmdAttach(args) {
   const sid = args["session-id"];
   if (!sid) return emit({ ok: false, error: "missing --session-id" }, 4);
+
+  // v0.8.0: lift any pre-existing project-scoped state out of the workingDir
+  // before resolving state paths. Never fatal.
+  try { migrateProjectStateToUserGlobal(args.cwd || process.cwd()); } catch {}
 
   let mission;
   try {

@@ -1,19 +1,37 @@
 // Single source of truth for mission-executor on-disk layout.
 //
-// Resolution order for layoutRoot() (first hit wins):
-//   1. MISSION_EXECUTOR_LAYOUT_ROOT env var (absolute or relative to project root) - preferred
-//   2. MISSION_EXECUTOR_STATE_DIR env var (BACK-COMPAT alias; MUST end in "/state"
-//      - the trailing "/state" is stripped to derive the layout root; any other
-//      shape throws a loud error pointing users at LAYOUT_ROOT)
-//   3. plugin.json "config.layoutRoot"; plugin.json "config.stateDir" accepted with same rule
-//   4. Legacy autodetect: if <project>/.omc/state/mission-executor-state.json exists, use ".omc"
-//      (keeps OMC installs + in-flight 0.4.x missions working without intervention)
-//   5. Default: ".mission-executor"
+// v0.8.0: project-scoped state moved out of cwd and under the user home.
+// Rationale: the plugin enables on every Claude Code session, in every repo.
+// Prior to 0.8.0 the default layoutRoot was "<cwd>/.mission-executor/", so
+// every project touched by the CLI ended up with a .mission-executor/ folder
+// holding hook-audit.log + session markers, even when no mission was ever
+// attached. That's pollution. From 0.8.0 the default lives at
+//   ~/.claude/mission-executor/projects/<slug>/
+// where <slug> matches Claude Code's existing project-slug scheme used at
+// ~/.claude/projects/<slug>/ (absolute path with "/" replaced by "-",
+// leading "-" preserved). Missions that explicitly want the old layout
+// keep working via MISSION_EXECUTOR_LAYOUT_ROOT.
 //
-// All subdirectories are CHILDREN of layoutRoot (not siblings of stateBase).
-// All callers use these helpers; no one builds paths by hand.
+// Resolution order for layoutRoot() (first hit wins):
+//   1. MISSION_EXECUTOR_LAYOUT_ROOT env var (absolute or relative to
+//      project root) — preferred operator escape hatch.
+//   2. MISSION_EXECUTOR_STATE_DIR env var (BACK-COMPAT alias; MUST end
+//      in "/state" — trailing "/state" is stripped to derive layout root;
+//      any other shape throws a loud error pointing at LAYOUT_ROOT).
+//   3. plugin.json "config.layoutRoot"; plugin.json "config.stateDir"
+//      accepted with same rule.
+//   4. Default (v0.8.0+): <userBase>/projects/<projectSlug(projectRoot())>.
+//
+// The v0.5.x ".omc/state/mission-executor-state.json" autodetect branch
+// was removed in 0.8.0 — it created exactly the cwd pollution we're
+// fixing. In-flight missions migrate via scripts/_lib/migrate.mjs >
+// migrateProjectStateToUserGlobal() called from mission-cli start|attach.
+//
+// All subdirectories are CHILDREN of layoutRoot. Every caller uses these
+// helpers; no one builds paths by hand.
 
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, isAbsolute, basename, dirname } from "node:path";
 
 function projectRoot() {
@@ -35,6 +53,28 @@ function stripStateSuffix(p) {
     `MISSION_EXECUTOR_STATE_DIR=${p}: back-compat alias requires a path ending in "/state" ` +
     `(e.g. ".omc/state"). Set MISSION_EXECUTOR_LAYOUT_ROOT instead to specify the layout root directly.`
   );
+}
+
+// ~/.claude/mission-executor/ — top-level user-global root. Holds the
+// cross-project registry.json and projects/<slug>/ subdirectories.
+export function userBase() {
+  return join(homedir() || "/tmp", ".claude", "mission-executor");
+}
+
+// Deterministic slug derived from an absolute project path. Matches the
+// scheme Claude Code uses at ~/.claude/projects/<slug>/: both "/" and "_"
+// collapse to "-". Example:
+//   /Users/jared/__void/tech-talks  -> -Users-jared---void-tech-talks
+// (leading "/" becomes leading "-"; "__" becomes "---" because each of
+// the two underscores and the preceding "/" each map to "-").
+export function projectSlug(absPath) {
+  if (!absPath || typeof absPath !== "string") {
+    throw new Error(`projectSlug: expected absolute path string, got ${absPath}`);
+  }
+  if (!isAbsolute(absPath)) {
+    throw new Error(`projectSlug: expected absolute path, got relative "${absPath}"`);
+  }
+  return absPath.replace(/[/_]/g, "-");
 }
 
 let _cached = null;
@@ -60,11 +100,7 @@ export function layoutRoot() {
     } catch {}
   }
 
-  if (existsSync(join(root, ".omc/state/mission-executor-state.json"))) {
-    return (_cached = join(root, ".omc"));
-  }
-
-  return (_cached = join(root, ".mission-executor"));
+  return (_cached = join(userBase(), "projects", projectSlug(root)));
 }
 
 export function stateBase()        { return join(layoutRoot(), "state"); }
@@ -78,7 +114,6 @@ export function heartbeatFile(sid) { return join(stateBase(), `driver-${sid}.hea
 export function validationDir()    { return join(layoutRoot(), "validation"); }
 export function proofsDir(id)      { return join(validationDir(), "proofs", id); }
 export function claimsLogFile()    { return join(validationDir(), "worker-claims.jsonl"); }
-export function handoffsInboxDir() { return join(layoutRoot(), "handoffs-inbox"); }
 export function workerSkillsDir()  { return join(layoutRoot(), "skills"); }
 
 // v0.5.1: per-mission event stream. Lives next to state.json / features.json /
@@ -86,7 +121,10 @@ export function workerSkillsDir()  { return join(layoutRoot(), "skills"); }
 // matching droid's MissionFileService location so dual-runtime workflows can
 // share the file.
 export function progressLogFile(missionPath) { return join(missionPath, "progress_log.jsonl"); }
-export function registryFile()     { return join(process.env.HOME || "/tmp", ".claude/mission-executor/registry.json"); }
+
+// Cross-project registry. Single top-level file under userBase(), shared
+// across every project. Was already user-global pre-0.8.0.
+export function registryFile()     { return join(userBase(), "registry.json"); }
 export function registryLockFile() { return registryFile() + ".lock"; }
 
 export function __resetForTest() { _cached = null; }

@@ -47,7 +47,7 @@ async function main() {
   try {
     parsed = JSON.parse(input);
   } catch {
-    audit("features-json-guard", { decision: "allow", reason: "unparseable-input" });
+    audit("features-json-guard", { decision: "allow", reason: "unparseable-input" }, { skipIfNoMission: true });
     process.stdout.write(JSON.stringify(allowPayload()));
     return;
   }
@@ -56,7 +56,7 @@ async function main() {
   const tool_input = parsed.tool_input || {};
 
   if (tool_name !== "Write" && tool_name !== "Edit") {
-    audit("features-json-guard", { decision: "allow", tool: tool_name, reason: "wrong-tool" });
+    audit("features-json-guard", { decision: "allow", tool: tool_name, reason: "wrong-tool" }, { skipIfNoMission: true });
     process.stdout.write(JSON.stringify(allowPayload()));
     return;
   }
@@ -67,7 +67,7 @@ async function main() {
   // unrelated files that happen to contain "features.json" in their path by
   // requiring the exact basename match.
   if (!/(^|\/)features\.json$/.test(filePath)) {
-    audit("features-json-guard", { decision: "allow", tool: tool_name, reason: "wrong-file" });
+    audit("features-json-guard", { decision: "allow", tool: tool_name, reason: "wrong-file" }, { skipIfNoMission: true });
     process.stdout.write(JSON.stringify(allowPayload()));
     return;
   }
@@ -103,6 +103,6 @@ async function main() {
 
 main().catch((e) => {
   process.stderr.write(`features-json-guard error: ${e.message}\n`);
-  audit("features-json-guard", { decision: "allow", reason: `error:${e.message}` });
+  audit("features-json-guard", { decision: "allow", reason: `error:${e.message}` }, { skipIfNoMission: true });
   process.stdout.write(JSON.stringify(allowPayload()));
 });

@@ -161,6 +161,7 @@ if (existsSync(commandsDir)) {
 
 const OMC_STATE_ALLOWLIST = new Set([
   "hooks/_lib/paths.mjs",
+  "scripts/_lib/migrate.mjs",  // v0.8.0 project-state migrator probes legacy layouts
   "scripts/selfcheck-hooks.mjs",  // defines the allowlist itself
   "AGENTS.md",
   "CHANGELOG.md",

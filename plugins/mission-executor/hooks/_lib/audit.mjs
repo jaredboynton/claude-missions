@@ -11,18 +11,31 @@
 // Contract:
 //   import { audit } from "./_lib/audit.mjs";
 //   audit("hook-name", { tool_name, phase, decision, note });
+//   audit("hook-name", payload, { skipIfNoMission: true });  // v0.8.0+
+//
+// v0.8.0 gate: callers that want "log only when a mission exists in this
+// project" pass opts.skipIfNoMission. The hook still fires its normal
+// logic; the audit line is just suppressed. Only truly mission-free
+// projects get zero writes. A project that has ever started a mission
+// (state.json present, even if inactive) continues to log — that's useful
+// post-mortem context.
 //
 // Log format: one JSON line per event with ts, hook, and arbitrary payload.
 
 import { appendFileSync, statSync, renameSync, mkdirSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
-import { auditLogFile } from "./paths.mjs";
+import { auditLogFile, stateFile } from "./paths.mjs";
 
 const MAX_BYTES = 1_048_576; // 1 MiB
 
 function resolveLogPath() {
   try { return auditLogFile(); }
   catch { return null; }  // projectRoot unresolvable; skip logging
+}
+
+function missionStateExists() {
+  try { return existsSync(stateFile()); }
+  catch { return false; }
 }
 
 function rotateIfLarge(path) {
@@ -32,8 +45,9 @@ function rotateIfLarge(path) {
   } catch {}
 }
 
-export function audit(hookName, payload = {}) {
+export function audit(hookName, payload = {}, opts = {}) {
   try {
+    if (opts.skipIfNoMission && !missionStateExists()) return;
     const path = resolveLogPath();
     if (!path) return;
     mkdirSync(dirname(path), { recursive: true });

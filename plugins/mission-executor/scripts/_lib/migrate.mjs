@@ -13,9 +13,10 @@
 // found, and the worst case is a missing proof flips the assertion to
 // "pending" via the contract-change detector on next invalidate run.
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, readdirSync, copyFileSync, statSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { proofsDir } from "./mission-paths.mjs";
+import { userBase, projectSlug } from "../../hooks/_lib/paths.mjs";
 
 const LEGACY_PROOF_DIRS = [".mission-executor/validation/proofs", ".omc/validation/proofs"];
 
@@ -124,3 +125,82 @@ export function upgradeLegacy052Proofs(missionPath) {
 
   return { migrated: migrated.length, invalidated: invalidated.length };
 }
+
+// v0.8.0 migration: project-scoped state moved from
+//   <workingDir>/.mission-executor/state/  (or <workingDir>/.omc/state/)
+// to
+//   ~/.claude/mission-executor/projects/<slug>/state/
+//
+// Called once per mission-cli start|attach with the absolute workingDir.
+// Idempotent: if the user-global target already has state, the function
+// leaves both sides alone and emits a stderr warning. If the target is
+// absent but legacy is present, the entire state dir is copied.
+// Originals are never deleted — operators do that themselves after
+// verifying the migration.
+//
+// Return: { migrated: <absPath>|null, skipped: <reason>|null }.
+export function migrateProjectStateToUserGlobal(workingDir) {
+  if (!workingDir || typeof workingDir !== "string") {
+    return { migrated: null, skipped: "no-working-dir" };
+  }
+  const abs = resolve(workingDir);
+
+  // If the operator has MISSION_EXECUTOR_LAYOUT_ROOT set, hooks resolve
+  // layoutRoot() to that value — no migration needed or wanted.
+  if (process.env.MISSION_EXECUTOR_LAYOUT_ROOT || process.env.MISSION_EXECUTOR_STATE_DIR) {
+    return { migrated: null, skipped: "env-override-active" };
+  }
+
+  let targetStateDir;
+  try {
+    targetStateDir = join(userBase(), "projects", projectSlug(abs), "state");
+  } catch (e) {
+    return { migrated: null, skipped: `slug-error:${e.message}` };
+  }
+
+  const legacyStateDirs = [
+    join(abs, ".mission-executor", "state"),
+    join(abs, ".omc", "state"),
+  ];
+
+  const legacy = legacyStateDirs.find((d) => {
+    try { return existsSync(join(d, "mission-executor-state.json")); }
+    catch { return false; }
+  });
+  if (!legacy) return { migrated: null, skipped: "no-legacy-state" };
+
+  // Target already has state — leave both alone, warn.
+  try {
+    if (existsSync(join(targetStateDir, "mission-executor-state.json"))) {
+      process.stderr.write(
+        `mission-executor: legacy project state exists at ${legacy} but user-global ` +
+        `state already populated at ${targetStateDir}; skipping migration. Delete ` +
+        `the legacy dir manually if obsolete.\n`
+      );
+      return { migrated: null, skipped: "target-exists" };
+    }
+  } catch {}
+
+  try {
+    copyDirRecursive(legacy, targetStateDir);
+    process.stderr.write(
+      `mission-executor: migrated project state from ${legacy} to ${targetStateDir}\n`
+    );
+    return { migrated: targetStateDir, skipped: null };
+  } catch (e) {
+    process.stderr.write(`mission-executor: project-state migration failed: ${e.message}\n`);
+    return { migrated: null, skipped: `copy-error:${e.message}` };
+  }
+}
+
+function copyDirRecursive(src, dst) {
+  mkdirSync(dst, { recursive: true });
+  for (const name of readdirSync(src)) {
+    const s = join(src, name);
+    const d = join(dst, name);
+    const st = statSync(s);
+    if (st.isDirectory()) copyDirRecursive(s, d);
+    else if (st.isFile() && !existsSync(d)) copyFileSync(s, d);
+  }
+}
+

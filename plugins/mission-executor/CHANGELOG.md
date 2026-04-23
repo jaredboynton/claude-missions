@@ -3,6 +3,92 @@
 All notable changes per release. Dates are the commit date of the version
 bump in [.claude-plugin/plugin.json](.claude-plugin/plugin.json).
 
+## 0.8.0 — 2026-04-22
+
+Project-scoped state relocates from the working directory to the user
+home. Before 0.8.0, every Claude Code session in every repo where the
+plugin was enabled created `<cwd>/.mission-executor/state/`, even when
+no mission was ever attached — four hooks logged to `hook-audit.log` on
+every Bash/Edit/Write call, and `session-start-record.mjs` wrote a
+session marker regardless. The result was `.mission-executor/` showing
+up in unrelated repos and staying there.
+
+### Changed
+
+- **Default `layoutRoot()` moved to user-global**: now
+  `~/.claude/mission-executor/projects/<slug>/` where `<slug>` matches
+  Claude Code's project-slug scheme used at `~/.claude/projects/<slug>/`
+  (absolute path with `/` and `_` collapsed to `-`). The `.omc/state/`
+  autodetect branch in `paths.mjs > layoutRoot()` was deleted — it was
+  the v0.5.x back-compat path that produced the pollution. Env-var
+  escape hatches (`MISSION_EXECUTOR_LAYOUT_ROOT`,
+  `MISSION_EXECUTOR_STATE_DIR`) and `plugin.json config.layoutRoot`
+  still override and take priority.
+- **`audit()` honors `opts.skipIfNoMission`** in
+  `hooks/_lib/audit.mjs`. When the caller passes `{ skipIfNoMission: true }`
+  AND no `mission-executor-state.json` exists for the project, the
+  audit line is suppressed. The four hooks that used to log
+  unconditionally — `worker-boundary-enforcer` (no-mission early
+  return), `assertion-proof-guard` (wrong-tool/wrong-file/error paths),
+  `features-json-guard` (same), `session-start-record` (per-session
+  marker) — now pass the flag on their no-op paths. Deny-path audits
+  (actual blocks) remain unconditional. Result: projects that have
+  never started a mission get zero audit writes.
+- **`registryFile()` anchored to `userBase()`** in `paths.mjs` (was a
+  manually built `$HOME/.claude/mission-executor/registry.json`). The
+  path is identical to pre-0.8.0; only the composition changed.
+
+### Added
+
+- **`userBase()` and `projectSlug(absPath)`** helpers in
+  `hooks/_lib/paths.mjs`. `userBase()` returns
+  `~/.claude/mission-executor/`. `projectSlug()` converts an absolute
+  project path to the filesystem-safe slug used for directory naming;
+  rejects relative or empty input.
+- **`migrateProjectStateToUserGlobal(workingDir)`** in
+  `scripts/_lib/migrate.mjs`. Probes `<workingDir>/.mission-executor/state/`
+  and `<workingDir>/.omc/state/`; if `mission-executor-state.json` is
+  present, recursively copies the state directory to the user-global
+  location. Idempotent: if the target already has state, both sides
+  are left alone with a stderr warning. Honors the env-var escape
+  hatches by bailing with `skipped: "env-override-active"`. Originals
+  are never deleted — operators clean up manually after verifying.
+  Called from `mission-cli.mjs > cmdStart` and `cmdAttach` on entry.
+- **`tests/paths.v080.test.mjs`** (7 tests): default layout, `.omc`
+  regression guard, slug rules, `$HOME` override, `registryFile`
+  location, env override still wins.
+- **`tests/migrate.project-state.test.mjs`** (7 tests):
+  `.mission-executor/` migration, `.omc/` migration, no-legacy,
+  target-exists conflict, idempotence, env-override suppression,
+  arg validation.
+
+### Removed
+
+- **`.omc/state/mission-executor-state.json` autodetect branch** in
+  `paths.mjs > layoutRoot()`. In-flight 0.5.x installs migrate via
+  `migrateProjectStateToUserGlobal()` on next mission start/attach.
+- **Two obsolete tests in `tests/paths.test.mjs`**
+  ("Legacy autodetect: .omc/state/..." and "Default: ... -> .mission-executor").
+  Both asserted pre-0.8.0 behaviors that no longer exist. Replaced by
+  `tests/paths.v080.test.mjs`.
+
+### Migration notes
+
+- No operator action required. First mission start or attach in a
+  project that has legacy state under `<cwd>/.mission-executor/state/`
+  or `<cwd>/.omc/state/` copies it into the user-global location and
+  emits one stderr line: `mission-executor: migrated project state
+  from <old> to <new>`. Subsequent runs no-op. Legacy directories are
+  preserved so operators can diff before deleting.
+- Projects with the env overrides (`MISSION_EXECUTOR_LAYOUT_ROOT` or
+  `MISSION_EXECUTOR_STATE_DIR`) are unaffected; migration bails with
+  `skipped: "env-override-active"`.
+- The cross-project `registry.json` lives at the same path as before
+  (`~/.claude/mission-executor/registry.json`); no migration needed.
+- `selfcheck-hooks.mjs` allowlist: `scripts/_lib/migrate.mjs` added,
+  since the migrator legitimately references `.omc/state/` when
+  probing legacy layouts.
+
 ## 0.7.0 — 2026-04-22
 
 Close-the-loop release. Ships the deferred `dispatchShellGeneric`

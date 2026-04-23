@@ -103,11 +103,16 @@ Storage model: a mission operates on exactly **one** git repo pointed to by
 `<missionPath>/working_directory.txt`. Mission artifacts
 (`validation-contract.md`, `validation-state.json`, `features.json`,
 `progress_log.jsonl`, `handoffs/`, `validation/proofs/`) live under
-`<missionPath>/`. Project-scoped state (`mission-executor-state.json`,
-session markers, `hook-audit.log`) stays in
-`<workingDir>/.mission-executor/state/` via `hooks/_lib/paths.mjs`. Meta-repo
-awareness and cross-repo touchpoint routing are intentionally absent; cross-
-repo work requires multiple missions.
+`<missionPath>/`. Project-scoped state
+(`mission-executor-state.json`, session markers, `hook-audit.log`) lives in
+`~/.claude/mission-executor/projects/<slug>/state/` since 0.8.0 — was
+`<workingDir>/.mission-executor/state/` in 0.5.x through 0.7.0. All paths
+resolve through `hooks/_lib/paths.mjs`. The cross-project registry
+(`registry.json`) lives one level up at `~/.claude/mission-executor/`. The
+env vars `MISSION_EXECUTOR_LAYOUT_ROOT` and `MISSION_EXECUTOR_STATE_DIR`
+still force a cwd-anchored layout for operators who want it. Meta-repo
+awareness and cross-repo touchpoint routing are intentionally absent;
+cross-repo work requires multiple missions.
 
 Two write channels, bright line: enforcement hooks write to `hook-audit.log`;
 the mission event stream (`progress_log.jsonl`) is owned by `mission-cli.mjs`
@@ -201,8 +206,11 @@ abstraction for one-off usage.
   `proof.contractSha256`. See CHANGELOG 0.6.0.
 - Do not introduce cross-repo touchpoint routing (`.meta` walking, child
   git repos). Cross-repo coordination requires multiple missions.
-- Do not remove the `.omc/` autodetect branch in `paths.mjs > layoutRoot()`
-  without a documented migration path — 1.0.0 candidate.
+- The `.omc/` autodetect branch in `paths.mjs > layoutRoot()` was removed
+  in 0.8.0. Back-compat now flows through
+  `scripts/_lib/migrate.mjs > migrateProjectStateToUserGlobal()`, invoked
+  by `mission-cli.mjs > cmdStart` / `cmdAttach`. Do not re-add the
+  autodetect — it was what produced the pre-0.8.0 cwd pollution.
 - Do not move `hooks/hooks.json` into `.claude-plugin/` — Claude Code's
   auto-discovery only scans `hooks/hooks.json`; `.claude-plugin/hooks.json`
   is silently ignored. v0.4.5 shipped that way and every mission ran with

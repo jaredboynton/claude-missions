@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -63,37 +63,13 @@ test("Tier 2: MISSION_EXECUTOR_STATE_DIR without trailing /state THROWS loudly (
   } finally { p.cleanup(); }
 });
 
-test("Legacy autodetect: .omc/state/mission-executor-state.json exists -> layoutRoot=.omc", async () => {
-  const p = mkProject();
-  try {
-    mkdirSync(join(p.root, ".omc/state"), { recursive: true });
-    writeFileSync(join(p.root, ".omc/state/mission-executor-state.json"), "{}");
-    const saved = { ...process.env };
-    process.env.CLAUDE_PROJECT_DIR = p.root;
-    delete process.env.MISSION_EXECUTOR_LAYOUT_ROOT;
-    delete process.env.MISSION_EXECUTOR_STATE_DIR;
-    delete process.env.CLAUDE_PLUGIN_ROOT;
-    const { layoutRoot, __resetForTest } = await loadPaths();
-    __resetForTest();
-    assert.equal(layoutRoot(), join(p.root, ".omc"));
-    Object.assign(process.env, saved);
-  } finally { p.cleanup(); }
-});
-
-test("Default: no env, no config, no legacy -> .mission-executor", async () => {
-  const p = mkProject();
-  try {
-    const saved = { ...process.env };
-    process.env.CLAUDE_PROJECT_DIR = p.root;
-    delete process.env.MISSION_EXECUTOR_LAYOUT_ROOT;
-    delete process.env.MISSION_EXECUTOR_STATE_DIR;
-    delete process.env.CLAUDE_PLUGIN_ROOT;
-    const { layoutRoot, __resetForTest } = await loadPaths();
-    __resetForTest();
-    assert.equal(layoutRoot(), join(p.root, ".mission-executor"));
-    Object.assign(process.env, saved);
-  } finally { p.cleanup(); }
-});
+// v0.8.0 replaced two pre-existing tests here:
+//   - "Legacy autodetect: .omc/state/ exists -> layoutRoot=.omc"
+//   - "Default: no env, no config, no legacy -> .mission-executor"
+// Both asserted pre-0.8.0 behavior that was intentionally removed (cwd
+// pollution). Coverage for the 0.8.0 defaults, the .omc autodetect
+// regression guard, and the new user-global layout lives in
+// tests/paths.v080.test.mjs.
 
 test("projectRoot throws on '/' (N5 fix)", async () => {
   const saved = { ...process.env };

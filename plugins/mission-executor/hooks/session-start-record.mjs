@@ -59,7 +59,7 @@ async function main() {
       }
     } catch {}
 
-    audit("session-start-record", { session_id: sid, action: "recorded" });
+    audit("session-start-record", { session_id: sid, action: "recorded" }, { skipIfNoMission: true });
   } catch (e) {
     process.stderr.write(`session-start-record: ${e.message}\n`);
   }

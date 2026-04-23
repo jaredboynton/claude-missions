@@ -102,7 +102,7 @@ async function main() {
 
   let parsed;
   try { parsed = JSON.parse(input); } catch {
-    audit("worker-boundary-enforcer", { decision: "allow", reason: "unparseable-input" });
+    audit("worker-boundary-enforcer", { decision: "allow", reason: "unparseable-input" }, { skipIfNoMission: true });
     process.stdout.write(JSON.stringify(allowPayload()));
     return;
   }
@@ -114,7 +114,7 @@ async function main() {
   const { state, reason } = loadAttachedMissionState({ sessionId, cwd });
 
   if (!state || !state.active || !state.missionPath) {
-    audit("worker-boundary-enforcer", { decision: "allow", tool: tool_name, reason: reason || "no-active-mission", session_id: sessionId });
+    audit("worker-boundary-enforcer", { decision: "allow", tool: tool_name, reason: reason || "no-active-mission", session_id: sessionId }, { skipIfNoMission: true });
     process.stdout.write(JSON.stringify(allowPayload()));
     return;
   }
@@ -165,6 +165,6 @@ async function main() {
 
 main().catch((e) => {
   process.stderr.write(`worker-boundary-enforcer error: ${e.message}\n`);
-  audit("worker-boundary-enforcer", { decision: "allow", reason: `error:${e.message}` });
+  audit("worker-boundary-enforcer", { decision: "allow", reason: `error:${e.message}` }, { skipIfNoMission: true });
   process.stdout.write(JSON.stringify({ decision: "allow" }));
 });

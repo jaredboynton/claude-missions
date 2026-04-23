@@ -54,7 +54,7 @@ async function main() {
   try {
     parsed = JSON.parse(input);
   } catch {
-    audit("assertion-proof-guard", { decision: "allow", reason: "unparseable-input" });
+    audit("assertion-proof-guard", { decision: "allow", reason: "unparseable-input" }, { skipIfNoMission: true });
     process.stdout.write(JSON.stringify(allowPayload()));
     return;
   }
@@ -63,14 +63,14 @@ async function main() {
   const tool_input = parsed.tool_input || {};
 
   if (tool_name !== "Write" && tool_name !== "Edit") {
-    audit("assertion-proof-guard", { decision: "allow", tool: tool_name, reason: "wrong-tool" });
+    audit("assertion-proof-guard", { decision: "allow", tool: tool_name, reason: "wrong-tool" }, { skipIfNoMission: true });
     process.stdout.write(JSON.stringify(allowPayload()));
     return;
   }
 
   const filePath = tool_input.file_path || tool_input.path || "";
   if (!filePath.endsWith(BLOCKED_FILENAME)) {
-    audit("assertion-proof-guard", { decision: "allow", tool: tool_name, reason: "wrong-file" });
+    audit("assertion-proof-guard", { decision: "allow", tool: tool_name, reason: "wrong-file" }, { skipIfNoMission: true });
     process.stdout.write(JSON.stringify(allowPayload()));
     return;
   }
@@ -102,6 +102,6 @@ async function main() {
 
 main().catch((e) => {
   process.stderr.write(`assertion-proof-guard error: ${e.message}\n`);
-  audit("assertion-proof-guard", { decision: "allow", reason: `error:${e.message}` });
+  audit("assertion-proof-guard", { decision: "allow", reason: `error:${e.message}` }, { skipIfNoMission: true });
   process.stdout.write(JSON.stringify(allowPayload()));
 });
