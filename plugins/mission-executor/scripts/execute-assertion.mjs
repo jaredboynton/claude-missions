@@ -37,6 +37,7 @@ import { createHash } from "node:crypto";
 import { recordAssertion } from "./record-assertion.mjs";
 import { proofsDir, relativeProofPath } from "./_lib/mission-paths.mjs";
 import { upgradeLegacy052Proofs } from "./_lib/migrate.mjs";
+import { recognizeEvidencePlan } from "./_lib/evidence-recognizers.mjs";
 import { fileURLToPath as _fileURLToPath } from "node:url";
 import { realpathSync as _realpathSync } from "node:fs";
 
@@ -756,9 +757,58 @@ function dispatchLiteralProbe(ctx) {
 // Returns { status: "passed"|"failed"|"blocked", ... }. Blocks (not fails)
 // when no runnable command could be extracted — the assertion is
 // narrative-only and requires operator attestation or the droid runtime.
+// Run an ExecutionPlan from evidence-recognizers.mjs. AND-reduces: every
+// command must exit 0 or the plan's status is "failed". Returns the same
+// shape as the single-command dispatchShellGeneric path so writeProofBundle
+// and recordAssertion stay unchanged.
+function executePlan(plan, ctx, origTool) {
+  const { workingDir } = ctx;
+  const results = [];
+  let firstFailExit = 0;
+  for (const cmd of plan.commands) {
+    const r = runCapture(cmd, workingDir);
+    results.push({ cmd, ...r });
+    if (r.exitCode !== 0 && firstFailExit === 0) firstFailExit = r.exitCode;
+  }
+  const passed = results.every((r) => r.exitCode === 0);
+  const stdout = results
+    .map((r) => `$ ${r.cmd}\n${r.stdout || ""}`.trimEnd())
+    .join("\n");
+  const stderr = results
+    .map((r) => (r.stderr ? `[${r.cmd}]\n${r.stderr}` : ""))
+    .filter(Boolean)
+    .join("\n");
+  const exitCode = passed ? 0 : firstFailExit || 1;
+  const commandRecord =
+    `# tool='${origTool}' (evidence-recognizer: ${plan.kind})\n` +
+    plan.commands.join("\n");
+  const expected = `tool='${origTool}' kind=${plan.kind} commands=${plan.commands.length} all-exit=0`;
+  return {
+    status: passed ? "passed" : "failed",
+    toolType: "cli-binary",
+    command: commandRecord,
+    exitCode,
+    stdout,
+    stderr,
+    expected,
+  };
+}
+
 function dispatchShellGeneric(ctx, origTool) {
   const { evidence, body, workingDir } = ctx;
   const searchText = (body || "") + "\n" + (evidence || "");
+
+  // Recognizer path (0.7.0+): try structured evidence shapes first so
+  // multi-command patterns (compound-AND, brace expansion, list-anchor,
+  // alternation-grep, negation-list) get proper per-command execution.
+  // Skipped under CRITIC_SPOT_CHECK=1 so the critic's Stage B verifies an
+  // existing pass with the SAME logic that produced it — introducing a
+  // parser under the critic would make verdicts depend on whichever
+  // recognizer happens to match, re-opening the 0.4.6 idempotency hole.
+  if (process.env.CRITIC_SPOT_CHECK !== "1") {
+    const plan = recognizeEvidencePlan(evidence, body);
+    if (plan) return executePlan(plan, ctx, origTool);
+  }
 
   // Known executables we'll accept as a runnable command prefix. Anything
   // outside this set is likely a placeholder or narrative reference.

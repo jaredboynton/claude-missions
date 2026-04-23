@@ -121,14 +121,13 @@ test("Every subdir is a direct child of layoutRoot (no sibling parent-dir games)
     delete process.env.MISSION_EXECUTOR_STATE_DIR;
     delete process.env.CLAUDE_PLUGIN_ROOT;
     const {
-      layoutRoot, stateBase, validationDir, handoffsInboxDir, workerSkillsDir,
+      layoutRoot, stateBase, validationDir, workerSkillsDir,
       __resetForTest,
     } = await loadPaths();
     __resetForTest();
     const root = layoutRoot();
     assert.equal(stateBase(), join(root, "state"));
     assert.equal(validationDir(), join(root, "validation"));
-    assert.equal(handoffsInboxDir(), join(root, "handoffs-inbox"));
     assert.equal(workerSkillsDir(), join(root, "skills"));
     Object.assign(process.env, saved);
   } finally { p.cleanup(); }

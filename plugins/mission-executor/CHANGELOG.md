@@ -3,6 +3,85 @@
 All notable changes per release. Dates are the commit date of the version
 bump in [.claude-plugin/plugin.json](.claude-plugin/plugin.json).
 
+## 0.7.0 — 2026-04-22
+
+Close-the-loop release. Ships the deferred `dispatchShellGeneric`
+broadening (five evidence-pattern recognizers) behind a
+`CRITIC_SPOT_CHECK` gate that mechanically eliminates Stage B verdict
+flicker, and removes the last bits of 0.6.0-obsolete text and dead code.
+Zero "deferred" items post-landing.
+
+### Added
+
+- **`scripts/_lib/evidence-recognizers.mjs`** — five recognizers for
+  evidence shapes the 0.4.6 basic dispatcher couldn't extract:
+  - `recognizeCompoundAnd` — two+ backticked runnable commands joined by
+    `;`, `+`, or `AND`. AND-reduces exits.
+  - `recognizeBraceExpansion` — single backticked command with a
+    `{a,b,c}` group, expanded into N per-token commands.
+  - `recognizeListAnchor` — comma-separated filenames + exec/existence
+    check prose + path prefix. Emits `<check> <prefix><file>` per file.
+  - `recognizeAlternation` — `a|b|c` pattern + negation prose + path
+    hint. Emits `! grep -qE 'a|b|c' <path>`. Splits on `|` first
+    (flaw #2 fix from the 0.5.x draft: concatenations starting with an
+    exec token like `cp -r|tar -xf|rsync` now match).
+  - `recognizeNegationList` — comma-separated identifier list + negation
+    prose + path hint. Emits negative grep with dots regex-escaped.
+  - `recognizeEvidencePlan` — priority dispatcher (compound-AND > brace
+    > list-anchor > alternation-grep > negation-list; first match wins).
+- **`scripts/execute-assertion.mjs > executePlan`** — runs each command
+  in an `ExecutionPlan`, AND-reduces exit codes, preserves 0.6.0 proof
+  shape (`toolType: "cli-binary"`, command record tagged with the
+  recognizer kind for audit).
+- **Recognizer path in `dispatchShellGeneric`** — recognizers are tried
+  BEFORE the basic `tryExtract` path (flaw #1 fix from the 0.5.x draft).
+  Unmatched evidence falls through to `tryExtract`, preserving 0.6.0
+  behavior for every shape the old dispatcher already handled.
+- **`CRITIC_SPOT_CHECK` gate on recognizers** — the critic's Stage B
+  sets `CRITIC_SPOT_CHECK=1` when spot-checking. The dispatcher skips
+  recognizers under that env var so existing passes are verified using
+  the same logic that produced them. Mechanically eliminates the Stage B
+  verdict-flicker path the 0.5.x draft's prior critic-review flagged as
+  a release-blocker.
+- **`tests/dispatcher-patterns.test.mjs`** — 30 unit tests (positive +
+  negative) across the five recognizers plus the priority dispatcher.
+- **`tests/dispatcher-broadening.test.mjs`** — 10 end-to-end integration
+  tests. Each of the five patterns has a passing-case fixture and a
+  failing-case fixture (where applicable). Plus a fall-through test that
+  verifies single-command evidence still routes through `tryExtract`.
+- **`tests/dispatcher-stage-b-safety.test.mjs`** — 3 tests proving the
+  `CRITIC_SPOT_CHECK` gate holds: gated critic runs don't flip verdicts
+  on recognizer-parseable manually-recorded assertions; two consecutive
+  runs produce identical counts (no `Math.random` flicker); and a
+  control test that confirms removing the gate WOULD produce a failure
+  (proves the fixture meaningfully exercises the gate rather than
+  passing trivially).
+
+### Removed
+
+- **`handoffsInboxDir()`** export in `hooks/_lib/paths.mjs` — dead code
+  since 0.5.1. Zero production callers. Its self-reference in
+  `tests/paths.test.mjs` is gone too.
+
+### Changed
+
+- **AGENTS.md Appendix D** — rewritten from "Deferred" to "Shipped in
+  0.7.0". Drops the obsolete flaw #3 (meta-repo cwd inference — 0.6.0
+  already killed the meta-repo concept). Fixes "0.5.0 draft" phrase to
+  "0.5.x draft" throughout. New section body documents the final
+  architecture: priority order, gate semantics, conservative-matching
+  discipline.
+
+### Migration notes
+
+- No operator action required. 0.7.0 is purely additive over 0.6.0 for
+  existing missions: a mission whose assertions already pass via basic
+  `tryExtract` continues to pass via that same path (recognizers return
+  `null` when their structural guards don't match). Fresh Phase 4b runs
+  on assertions whose evidence fits one of the five patterns now
+  produce proofs tagged with `# evidence-recognizer: <kind>` in the
+  proof's `command` field.
+
 ## 0.6.0 — 2026-04-22
 
 Droid alignment: pure-droid staleness model, mission-centric proof
