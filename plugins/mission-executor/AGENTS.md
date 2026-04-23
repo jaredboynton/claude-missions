@@ -51,7 +51,9 @@ plugins/mission-executor/
 ├── commands/                   Slash-command markdown (execute, detach, status, abort)
 ├── hooks/
 │   ├── hooks.json              Discovery path — MUST live here, not in .claude-plugin/
-│   ├── _lib/                   paths.mjs (project-scoped), mission-state.mjs, audit.mjs
+│   ├── _lib/                   paths.mjs (project-scoped), mission-state.mjs,
+│   │                           audit.mjs, hook-output.mjs (canonical JSON shapes),
+│   │                           registry.mjs
 │   └── <hook>.mjs              9 hooks: PreToolUse (5), PostToolUse (2), Stop, SessionStart
 ├── scripts/
 │   ├── _lib/                   Shared helpers (progress-log, schemas, lockfile,
@@ -118,6 +120,11 @@ Two write channels, bright line: enforcement hooks write to `hook-audit.log`;
 the mission event stream (`progress_log.jsonl`) is owned by `mission-cli.mjs`
 and `write-handoff.mjs`. Do not cross.
 
+Hook JSON output: every hook goes through `hooks/_lib/hook-output.mjs`
+(`preAllow`, `preDeny`, `postContext`, `stopBlock`, `noop`) to produce
+Claude Code 2.1.118-compliant payloads. Do not hand-construct hybrid
+legacy + `hookSpecificOutput` JSON — the 2.1.118 schema rejects it.
+
 ## Coding Conventions
 
 - Node ES modules only. File extension `.mjs`. No CommonJS.
@@ -141,8 +148,15 @@ and `write-handoff.mjs`. Do not cross.
 - **Never hand-write `features.json`** — `features-json-guard.mjs` blocks it.
   Use `sync-features-state.mjs` (git-HEAD-driven) or
   `reconcile-external-work.mjs --apply` (proof-gated).
+- **Never hand-construct hook JSON** — import from `hooks/_lib/hook-output.mjs`.
+  Hybrid legacy + `hookSpecificOutput` payloads fail Claude Code 2.1.118
+  schema validation ("(root): Invalid input").
 - Worker claims in tool output (e.g. `VAL-XXX: PASS`) are audit-only and
   land in `claimsLogFile()`. They do NOT flip status.
+- Assertion status domain: `passed`, `failed`, `pending`, `stale`,
+  `blocked`. `blocked` (0.8.1+) means `dispatchShellGeneric` found no
+  runnable plan; the assertion is recorded, not silently pending. Critic
+  treats `blocked` as non-failing (verdict `INCOMPLETE`, not `FAIL`).
 - Schema validation is hand-rolled in `scripts/_lib/schemas.mjs`. Shape:
   `validate(schema, value) → { ok: true, value } | { ok: false, errors: string[] }`.
 - Tests use `import { test } from "node:test"` + `assert from "node:assert/strict"`.
@@ -218,6 +232,14 @@ abstraction for one-off usage.
   `"hooks": "./hooks/hooks.json"` belt-and-braces.
 - Do not assume Stop hooks alone catch bypasses — they are flaky (upstream
   #22925, #29881, #8615, #12436). Always layer PreToolUse alongside Stop.
+- Do not spawn `node execute-assertion.mjs --id=<id>` from the critic.
+  Use `executeAssertionReadOnly(missionPath, { id })` (0.8.1+) — it sets
+  `CRITIC_SPOT_CHECK=1` in-process so the gate inside `executeAssertion()`
+  takes the early-return path BEFORE `writeProofBundle`, and restores the
+  env var on exit. Spawning re-exposed the Stage B proof-overwrite bug.
+- Do not emit hybrid `{decision: "allow", hookSpecificOutput: {...}}`
+  shapes from PreToolUse/PostToolUse hooks. Claude Code 2.1.118's
+  JSON-schema validator rejects them — see `hooks/_lib/hook-output.mjs`.
 - Do not change the worker-return schema (`workerHandoffSchema`) without
   coordinating with droid — we track a subset of droid's shapes and
   re-review every major droid release.
@@ -300,4 +322,8 @@ Decision tree and caveats: `skills/mission-execute/SKILL.md` Phase 3
   appears bypassed.
 - `CHANGELOG.md` 0.5.1 (progress log + handoff schemas), 0.6.0 (droid
   alignment, contract-driven staleness, single-repo model), 0.7.0
-  (`dispatchShellGeneric` recognizers + `CRITIC_SPOT_CHECK` gate).
+  (`dispatchShellGeneric` recognizers + `CRITIC_SPOT_CHECK` gate), 0.8.0
+  (user-global project state, audit gating, `migrateProjectStateToUserGlobal`),
+  0.8.1 (Claude Code 2.1.118 hook JSON, critic proof-bundle idempotency,
+  narrative-literal recognizer, `blocked` status, per-entry schema
+  warnings, `is-attached` query-success exit codes).
