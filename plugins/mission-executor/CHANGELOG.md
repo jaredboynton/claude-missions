@@ -3,6 +3,75 @@
 All notable changes per release. Dates are the commit date of the version
 bump in [.claude-plugin/plugin.json](.claude-plugin/plugin.json).
 
+## 0.8.4 — 2026-04-23
+
+Two defects surfaced in live use of 0.8.3 on a multi-project workstation.
+
+**Defect 1 — cross-project session-id leak (silent autopilot bypass).**
+`scripts/_lib/resolve-sid.sh`'s Tier 3b fallback globbed
+`~/.claude/projects/*/*.jsonl` across EVERY project and picked the newest
+by mtime, then handed that SID to `mission-cli.mjs start --session-id=`.
+On a workstation with multiple active Claude Code sessions, this silently
+recorded the wrong session's SID in the mission state file, so every
+downstream `is-attached` check returned `attached:false`, and the
+autopilot Stop-hook + `no-ask-during-mission` + `worker-boundary-enforcer`
+hooks all silently no-opped. The first wave's "the hooks never fired"
+post-mortem was wrong — they fired, but keyed off a SID belonging to a
+sibling project's session. Lesson 17's autopilot guarantee was defeated
+by a resolver bug one level below the enforcement layer.
+
+**Defect 2 — `/mission-executor:...` is too long for real-world use.**
+Claude Code autocomplete lists plugin commands as `/<plugin-name>:<cmd>`
+with the plugin's `name` field from `plugin.json`. With
+`name: "mission-executor"` every autocomplete entry was 18+ chars before
+the actual command (`/mission-executor:execute`, `/mission-executor:status`,
+…). Renaming to `name: "mission"` gives the much more ergonomic
+`/mission:execute`, `/mission:status`, `/mission:abort`, `/mission:detach`.
+Filesystem layout, hook registrations, env-var names
+(`MISSION_EXECUTOR_LAYOUT_ROOT`, `MISSION_EXECUTOR_STATE_DIR`,
+`MISSION_EXECUTOR_WRITER`), state-path scheme
+(`~/.claude/mission-executor/projects/<slug>/`), and the plugin directory
+on disk all stay as `mission-executor` — the rename only touches the
+user-facing autocomplete prefix.
+
+### Fixed
+
+- **`scripts/_lib/resolve-sid.sh`: Tier 3b jsonl-filename fallback is
+  now PROJECT-SCOPED** via a new `state-path-cli.mjs project-slug` key
+  that emits the current project's slug. The resolver only looks inside
+  `~/.claude/projects/<current-slug>/*.jsonl`; the cross-project glob
+  is gone. When no SID can be resolved, the resolver returns empty
+  instead of inventing one, and `mission-cli.mjs start`'s existing
+  `missing --session-id` exit-4 path surfaces the failure loudly.
+- **`plugin.json` `name` changed from `mission-executor` to `mission`**,
+  and `.claude-plugin/marketplace.json` updated to match. Existing
+  `/mission-executor:*` commands continue to work for users on 0.8.3
+  and below; 0.8.4+ users see `/mission:*` in autocomplete instead.
+  Plugin *directory* name, env-var names, state paths, and all internal
+  identifiers are unchanged — a rename purely at the autocomplete layer.
+
+### Added
+
+- **`hooks/session-start-record.mjs` now also appends
+  `export CLAUDE_CODE_SESSION_ID="<sid>"` to `$CLAUDE_ENV_FILE`** so
+  Bash-tool invocations source the SID directly instead of scanning
+  state files. Guarded by a grep so resume/continue sessions don't
+  stack duplicate exports. Based on the workaround published on
+  [anthropics/claude-code#25642](https://github.com/anthropics/claude-code/issues/25642)
+  — the native `CLAUDE_SESSION_ID` env-var feature request is still
+  open. Note that `$CLAUDE_ENV_FILE` is **not** sourced for
+  slash-command `!cmd` template-expansion (see
+  [anthropics/claude-code#49780](https://github.com/anthropics/claude-code/issues/49780)),
+  so slash commands still use the `.active`-file path in
+  `resolve-sid.sh`.
+- **`tests/resolve-sid.test.mjs`** — 8 cases, including the explicit
+  regression guard "tier 3b MUST NOT leak SID from a newer jsonl in a
+  different project" (verified to catch the pre-0.8.4 behavior when the
+  old resolver is reinstated).
+- **`tests/session-start-env-file.test.mjs`** — 4 cases covering the
+  new env-file export, the duplicate-guard, the no-`$CLAUDE_ENV_FILE`
+  no-op, and the missing-session_id graceful path.
+
 ## 0.8.3 — 2026-04-23
 
 Immediately after 0.8.2 unblocked argument-forwarding, a second defect

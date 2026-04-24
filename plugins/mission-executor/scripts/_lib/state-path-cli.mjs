@@ -13,8 +13,20 @@
 
 import {
   layoutRoot, stateBase, stateFile, auditLogFile,
-  sessionIdDir, validationDir, registryFile,
+  sessionIdDir, validationDir, registryFile, projectSlug,
 } from "../../hooks/_lib/paths.mjs";
+
+// projectSlug(cwd) — emit the same slug Claude Code uses at
+// ~/.claude/projects/<slug>/. Used by resolve-sid.sh to scope its
+// jsonl-filename fallback to THIS project only, preventing the
+// cross-project SID leak where `ls -t ~/.claude/projects/*/*.jsonl`
+// picked the newest-mtime file from any project on the machine.
+function currentProjectSlug() {
+  const root = process.env.CLAUDE_PROJECT_DIR
+             || process.env.CLAUDE_WORKING_DIR
+             || process.cwd();
+  return projectSlug(root);
+}
 
 const key = process.argv[2] || "";
 const table = {
@@ -25,6 +37,7 @@ const table = {
   "session-id-dir": sessionIdDir,
   "validation-dir": validationDir,
   "registry": registryFile,
+  "project-slug": currentProjectSlug,
 };
 
 const fn = table[key];
