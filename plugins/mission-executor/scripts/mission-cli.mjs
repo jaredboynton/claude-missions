@@ -371,6 +371,25 @@ async function cmdComplete(args) {
 
     emitEvent(missionPath, "mission_completed", { sessionId: sid, forced: force, missionId });
 
+    // v0.8.7 (D3): seal the mission by writing state.json.state=completed and
+    // emitting a distinct mission_sealed event. cmdComplete previously only
+    // released the autopilot Stop-hook (via OMC state mutation above) and left
+    // the mission's own state.json at state="running" — which is why the
+    // orchestrator kept spawning workers for 80+ minutes after
+    // mission_completed fired (observed in mission 3af5aaea).
+    if (missionPath) {
+      try {
+        const sp = join(missionPath, "state.json");
+        if (existsSync(sp)) {
+          const doc = JSON.parse(readFileSync(sp, "utf8"));
+          doc.state = "completed";
+          doc.updatedAt = nowIso();
+          writeFileSync(sp, JSON.stringify(doc, null, 2) + "\n");
+        }
+      } catch {}
+      emitEvent(missionPath, "mission_sealed", { sessionId: sid, forced: force, missionId });
+    }
+
     emit({ ok: true, action: "completed", forced: !!force });
   } catch (e) {
     if (e.code === "LOCK_TIMEOUT") return emit({ ok: false, error: "lock-timeout" }, 6);
