@@ -4,7 +4,7 @@ argument-hint: [mission-path-or-id]
 allowed-tools: Bash(node:*), Bash(cat:*), Bash(ls:*), Bash(jq:*), Bash(basename:*), Bash(sed:*), Bash(xargs:*), Bash(head:*), Bash(.:*), Read, Skill
 ---
 
-!`. "${CLAUDE_PLUGIN_ROOT}/scripts/_lib/resolve-sid.sh"; SID=$(resolve_sid); node "${CLAUDE_PLUGIN_ROOT}/scripts/mission-cli.mjs" start "$ARGUMENTS" --session-id="${SID}"`
+!`SID=$("${CLAUDE_PLUGIN_ROOT}/scripts/_lib/resolve-sid.sh"); node "${CLAUDE_PLUGIN_ROOT}/scripts/mission-cli.mjs" start "$ARGUMENTS" --session-id="${SID}"`
 
 The session is now attached (see `action` in the JSON above: `started` or `attached-to-existing`).
 

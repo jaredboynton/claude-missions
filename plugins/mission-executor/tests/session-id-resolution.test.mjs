@@ -5,9 +5,13 @@ import { writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { sandbox, HOOKS, PLUGIN_ROOT } from "./_helpers.mjs";
 
+// Execute resolve-sid.sh as a standalone script (0.8.5+). The pre-0.8.5
+// sourced-function API is gone because Claude Code does not export
+// $CLAUDE_PLUGIN_ROOT to slash-command subprocesses
+// (anthropics/claude-code#42564, #48230, #24529).
 function resolveSid(env, stdin = null) {
-  const cmd = `. "${PLUGIN_ROOT}/scripts/_lib/resolve-sid.sh" && resolve_sid`;
-  const r = spawnSync("sh", ["-c", cmd], {
+  const RESOLVER = `${PLUGIN_ROOT}/scripts/_lib/resolve-sid.sh`;
+  const r = spawnSync(RESOLVER, [], {
     env, encoding: "utf8",
     input: stdin === null ? "" : stdin,
     stdio: stdin === null ? ["ignore", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],

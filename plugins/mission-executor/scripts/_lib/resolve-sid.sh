@@ -1,65 +1,67 @@
 #!/bin/sh
-# Session-id resolver sourced by every mission-executor command.
+# Session-id resolver. STANDALONE SCRIPT — do NOT source it.
 #
-# Tier 1:  env var set by Claude Code itself (per-process, no race)
-# Tier 1b: env var exported by THIS plugin's SessionStart hook via
-#          $CLAUDE_ENV_FILE (persists across Bash tool calls; does NOT
-#          reach slash-command `!cmd` template-expansion — see
-#          anthropics/claude-code#49780 — which is why tiers 3a/3b
-#          still exist).
-# Tier 2:  stdin JSON payload from Claude Code hooks (per-process, no
-#          race; only fires for real hook invocations, not slash-cmd
-#          bash blocks which pipe nothing).
-# Tier 3a: per-session file written by this plugin's SessionStart hook
-#          into <layoutRoot>/state/sessions/<sid>.active. Scoped to the
-#          current project by construction.
-# Tier 3b: ~/.claude/projects/<this-project-slug>/*.jsonl filename
-#          fallback. Covers the cold-start window before SessionStart
-#          has fired in this project. **Restricted to the current
-#          project's slug**; the pre-0.8.4 glob searched across ALL
-#          projects, which (on multi-project machines) handed out a
-#          SID from whichever project happened to have the newest
-#          jsonl file — a nasty silent failure mode.
+#   usage: SID=$("$CLAUDE_PLUGIN_ROOT/scripts/_lib/resolve-sid.sh")
 #
-# If all tiers fail, this prints the empty string. Callers MUST check
-# for an empty result and refuse to proceed — mission-cli's
-# `--session-id=` handling already rejects missing/empty values with
-# exit code 4. Never invent a SID.
+# Historical note (v0.5.0-0.8.4): this file was sourced by command
+# backtick-blocks (`. resolve-sid.sh; SID=$(resolve_sid)`). That worked
+# as long as `$CLAUDE_PLUGIN_ROOT` was available as a shell env var in
+# the block. Per anthropics/claude-code#42564, #48230, #24529 the
+# variable is NOT exported to the spawned process — Claude Code only
+# text-substitutes `${CLAUDE_PLUGIN_ROOT}` in the markdown source before
+# running the block. So `resolve-sid.sh`'s internal
+# `[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]` guards always failed and both
+# tier-3 lookups were skipped. From 0.8.5 this script self-locates via
+# `$0` (the path Claude Code already resolved when it invoked us) and
+# passes the plugin root to `state-path-cli.mjs` explicitly, so it no
+# longer depends on an env var the harness doesn't set.
 #
-# Output: prints the resolved session-id to stdout (possibly empty).
+# Tiers (first non-empty wins):
+#   1.   env var CLAUDE_SESSION_ID / CLAUDE_CODE_SESSION_ID (only in
+#        hook/tool contexts that Claude Code currently populates).
+#   2.   stdin JSON payload (hooks only; `[ -t 0 ]` skip guards the
+#        interactive-shell hang case).
+#   3a.  <layoutRoot>/state/sessions/<sid>.active — written by THIS
+#        plugin's SessionStart hook. Scoped to the current project.
+#   3b.  ~/.claude/projects/<current-project-slug>/*.jsonl — scoped to
+#        the current project, never cross-project (cross-project glob
+#        was the 0.8.3 silent-failure mode).
+#
+# Prints the resolved session-id to stdout. Empty string if all tiers
+# miss; callers MUST refuse to proceed on empty (mission-cli rejects
+# empty `--session-id=` with exit 4).
+
+# Self-locate so we don't need $CLAUDE_PLUGIN_ROOT in the env.
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+PATH_CLI="$SCRIPT_DIR/state-path-cli.mjs"
 
 resolve_sid() {
-  # Tier 1: native Claude Code env var. Present only in hook/tool
-  # contexts where Claude Code exposes it directly; not in slash-cmd
-  # `!cmd` blocks today (2.1.119+ as of 2026-04).
+  # Tier 1
   SID="${CLAUDE_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-}}"
 
-  # Tier 2: hook stdin JSON. `[ -t 0 ]` guards against hanging when
-  # stdin is a tty (interactive shell); slash-cmd bash blocks pipe
-  # nothing, so this is a no-op there, but it's free to attempt.
+  # Tier 2 — only attempt if stdin is piped
   if [ -z "$SID" ] && [ ! -t 0 ]; then
     if command -v jq >/dev/null 2>&1; then
       SID=$(jq -r '.session_id // empty' 2>/dev/null < /dev/stdin || true)
     fi
   fi
 
-  # Tier 3a: per-session .active file written by SessionStart hook,
-  # scoped to this project's layoutRoot. Pick the newest by mtime.
-  if [ -z "$SID" ] && [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
-    SID_DIR=$(node "${CLAUDE_PLUGIN_ROOT}/scripts/_lib/state-path-cli.mjs" session-id-dir 2>/dev/null)
+  # Tier 3a — per-session .active file in layoutRoot/state/sessions.
+  # state-path-cli.mjs resolves that path from paths.mjs, which reads
+  # CLAUDE_PROJECT_DIR || CLAUDE_WORKING_DIR || process.cwd() — and
+  # cwd is set correctly to the project root by Claude Code for
+  # slash-command subprocesses.
+  if [ -z "$SID" ]; then
+    SID_DIR=$(node "$PATH_CLI" session-id-dir 2>/dev/null)
     if [ -n "$SID_DIR" ] && [ -d "$SID_DIR" ]; then
       SID=$(ls -t "$SID_DIR"/*.active 2>/dev/null | head -1 | xargs -r -n1 basename 2>/dev/null | sed 's/\.active$//')
     fi
   fi
 
-  # Tier 3b: jsonl-filename fallback, PROJECT-SCOPED. Earlier versions
-  # globbed ~/.claude/projects/*/*.jsonl across every project, which
-  # silently handed out a SID from an unrelated project whenever the
-  # current project hadn't had its .active file written yet. This
-  # version asks state-path-cli for the current project's slug and
-  # only looks inside that slug's directory.
-  if [ -z "$SID" ] && [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
-    SLUG=$(node "${CLAUDE_PLUGIN_ROOT}/scripts/_lib/state-path-cli.mjs" project-slug 2>/dev/null)
+  # Tier 3b — PROJECT-SCOPED jsonl fallback. The current project's
+  # slug directory only; the cross-project glob from 0.8.3 is gone.
+  if [ -z "$SID" ]; then
+    SLUG=$(node "$PATH_CLI" project-slug 2>/dev/null)
     if [ -n "$SLUG" ]; then
       PROJ_DIR="${HOME}/.claude/projects/${SLUG}"
       if [ -d "$PROJ_DIR" ]; then
@@ -73,3 +75,5 @@ resolve_sid() {
 
   printf '%s' "$SID"
 }
+
+resolve_sid

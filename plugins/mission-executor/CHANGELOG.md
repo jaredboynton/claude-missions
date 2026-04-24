@@ -3,6 +3,72 @@
 All notable changes per release. Dates are the commit date of the version
 bump in [.claude-plugin/plugin.json](.claude-plugin/plugin.json).
 
+## 0.8.5 — 2026-04-23
+
+Another silent-autopilot-bypass defect surfaced in 0.8.4 live use on
+this same workstation: `/mission:execute <uuid>` exited with
+`{"ok":false,"error":"missing --session-id"}` instead of registering.
+
+### Root cause
+
+`${CLAUDE_PLUGIN_ROOT}` is text-substituted by Claude Code inside a
+slash command's `!cmd` backtick block before the shell runs — that
+part works — but the corresponding shell environment variable is NOT
+exported to the spawned subprocess. This is documented upstream as
+[anthropics/claude-code#42564](https://github.com/anthropics/claude-code/issues/42564),
+[#48230](https://github.com/anthropics/claude-code/issues/48230), and
+[#24529](https://github.com/anthropics/claude-code/issues/24529).
+
+The 0.5.0–0.8.4 resolver was *sourced* into the caller shell and then
+checked `[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]` before looking up its
+sibling `state-path-cli.mjs`. That check saw an empty string, so
+Tier 3a (`.active` file) AND Tier 3b (project-scoped jsonl fallback)
+were silently skipped — every call went straight through Tiers 1 and
+2 (both empty in slash-command contexts) and returned "". 0.8.4's
+hardening against cross-project leaks actually made this failure
+**more** visible (empty SID → `missing --session-id` loud error)
+instead of silently picking a stranger's SID, but the resolver
+itself still didn't work.
+
+### Fixed
+
+- **`scripts/_lib/resolve-sid.sh` converted from a sourced shell
+  function to a standalone executable script.** The script
+  self-locates via `cd "$(dirname "$0")"` — a POSIX-portable pattern
+  that works whether invoked by absolute path, relative path, or via
+  `PATH` lookup — and uses its own directory to find
+  `state-path-cli.mjs`. Zero dependency on `$CLAUDE_PLUGIN_ROOT` being
+  exported to the shell environment. Matches the workaround pattern
+  recommended in anthropics/claude-code#24529 (the superpowers plugin
+  uses a similar per-plugin fallback).
+- **All four command files (`execute.md`, `status.md`, `abort.md`,
+  `detach.md`) now invoke the resolver as a standalone script**:
+  `SID=$("${CLAUDE_PLUGIN_ROOT}/scripts/_lib/resolve-sid.sh")` instead
+  of `. "${CLAUDE_PLUGIN_ROOT}/scripts/_lib/resolve-sid.sh"; SID=$(resolve_sid)`.
+  The outer `${CLAUDE_PLUGIN_ROOT}` is text-substituted by Claude
+  Code, so the path to the script is known; the script then handles
+  its own environment internally.
+- **Pre-existing `tests/session-id-resolution.test.mjs` updated** to
+  invoke the resolver via its new standalone entry point.
+
+### Added
+
+- **Two new tests in `tests/resolve-sid.test.mjs`**:
+  - "resolver works without `CLAUDE_PLUGIN_ROOT` (self-locates via
+    `$0`)" — directly freezes the 0.8.5 contract by deleting the env
+    var from the child's environment and asserting the resolver
+    still returns the correct SID.
+  - "resolver is executable and prints SID directly (no sourcing
+    required)" — verifies the shebang + executable bit combo works
+    via direct spawn rather than `sh -c`.
+- **Four new assertions in `tests/commands-arg-shape.test.mjs`** — one
+  per command file — that freeze the standalone-script invocation
+  shape. Each assertion requires the `SID=$("…/resolve-sid.sh")`
+  pattern AND explicitly rejects both the old `. "…/resolve-sid.sh"`
+  sourced invocation AND any reference to the removed `resolve_sid`
+  shell function. Catches the exact regression pattern that led to
+  this bug.
+
 ## 0.8.4 — 2026-04-23
 
 Two defects surfaced in live use of 0.8.3 on a multi-project workstation.

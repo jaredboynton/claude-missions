@@ -24,14 +24,13 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = dirname(__dirname);
 const RESOLVER = join(PLUGIN_ROOT, "scripts/_lib/resolve-sid.sh");
 
-// Spawn `sh -c '. resolve-sid.sh; resolve_sid'` with a controlled env.
-// Returns stdout (the resolved SID, possibly empty).
+// Execute resolve-sid.sh as a standalone script (post-0.8.5 pattern).
+// Pre-0.8.5 the shell function was sourced into the caller; that relied
+// on $CLAUDE_PLUGIN_ROOT being exported (it isn't — see commands-arg-
+// shape.test.mjs for the full rationale). Tests MUST exercise the exact
+// invocation pattern commands use today.
 function runResolver(env) {
-  const r = spawnSync(
-    "sh",
-    ["-c", `. "${RESOLVER}"; resolve_sid`],
-    { env, encoding: "utf8" },
-  );
+  const r = spawnSync(RESOLVER, [], { env, encoding: "utf8" });
   return { stdout: r.stdout || "", stderr: r.stderr || "", code: r.status };
 }
 
@@ -190,5 +189,38 @@ test("state-path-cli.mjs project-slug emits the current project's slug", () => {
     ], { env: s.env, encoding: "utf8" });
     assert.equal(r.status, 0);
     assert.equal(r.stdout, s.projSlug);
+  } finally { s.cleanup(); }
+});
+
+test("resolver works without CLAUDE_PLUGIN_ROOT (self-locates via $0)", () => {
+  // 0.8.5 contract: slash-command !cmd blocks do NOT export
+  // CLAUDE_PLUGIN_ROOT (anthropics/claude-code#42564, #48230, #24529).
+  // The resolver must still find its sibling state-path-cli.mjs and
+  // resolve the SID correctly via self-location.
+  const s = sandbox();
+  try {
+    seedActive(join(s.env.MISSION_EXECUTOR_LAYOUT_ROOT, "state/sessions"), "no-plugin-root-sid");
+    const env = { ...s.env };
+    delete env.CLAUDE_PLUGIN_ROOT;
+    const r = runResolver(env);
+    assert.equal(
+      r.stdout, "no-plugin-root-sid",
+      `expected SID even with CLAUDE_PLUGIN_ROOT unset (stderr: ${r.stderr})`,
+    );
+  } finally { s.cleanup(); }
+});
+
+test("resolver is executable and prints SID directly (no sourcing required)", () => {
+  // The command files invoke the resolver as a standalone script:
+  //   SID=$("…/resolve-sid.sh")
+  // That requires the file to be executable AND to print the SID to
+  // stdout when run directly. Sourcing-only shapes would regress.
+  const s = sandbox();
+  try {
+    seedActive(join(s.env.MISSION_EXECUTOR_LAYOUT_ROOT, "state/sessions"), "exec-shape-sid");
+    // Run directly, not via `sh -c` — exercises the shebang + exec bit.
+    const r = spawnSync(RESOLVER, [], { env: s.env, encoding: "utf8" });
+    assert.equal(r.status, 0, `exit ${r.status}, stderr: ${r.stderr}`);
+    assert.equal(r.stdout, "exec-shape-sid");
   } finally { s.cleanup(); }
 });

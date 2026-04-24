@@ -97,3 +97,46 @@ for (const cmd of NO_ARG_COMMANDS) {
     }
   });
 }
+
+// Freeze the 0.8.5 resolver invocation shape. Commands must EXECUTE
+// resolve-sid.sh as a standalone script (SID=$("…/resolve-sid.sh"))
+// and must NOT source it (`. "…/resolve-sid.sh"; SID=$(resolve_sid)`).
+// Reason: slash-command `!cmd` blocks don't export $CLAUDE_PLUGIN_ROOT
+// as a shell env var (anthropics/claude-code#42564, #48230, #24529),
+// so any sourced function relying on that env var sees it empty and
+// skips fallback tiers. Standalone invocation lets the script
+// self-locate via `$0` and then find its sibling state-path-cli.mjs
+// without any env dependency.
+const ALL_CLI_COMMANDS = [...ARG_FORWARDING_COMMANDS, ...NO_ARG_COMMANDS];
+for (const cmd of ALL_CLI_COMMANDS) {
+  test(`commands/${cmd}: invokes resolve-sid.sh as a standalone script, not sourced`, () => {
+    const src = readCommand(cmd);
+    const lines = bashExecLines(src);
+    for (const line of lines) {
+      if (!line.includes("resolve-sid.sh")) continue;
+
+      // Must look like: SID=$("…/resolve-sid.sh")
+      assert.match(
+        line,
+        /SID=\$\(\s*"\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/_lib\/resolve-sid\.sh"\s*\)/,
+        `${cmd}: must invoke resolve-sid.sh as a standalone script via ` +
+        `SID=$("\${CLAUDE_PLUGIN_ROOT}/scripts/_lib/resolve-sid.sh"). Got: ${line}`,
+      );
+
+      // Must NOT source-and-call (the pre-0.8.5 pattern).
+      assert.doesNotMatch(
+        line,
+        /\.\s+"\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/_lib\/resolve-sid\.sh"/,
+        `${cmd}: must not source resolve-sid.sh; the sourced function ` +
+        `relied on $CLAUDE_PLUGIN_ROOT being exported, which Claude Code ` +
+        `does not do. Got: ${line}`,
+      );
+      assert.doesNotMatch(
+        line,
+        /\bresolve_sid\b/,
+        `${cmd}: must not call the resolve_sid shell function; use the ` +
+        `standalone script instead. Got: ${line}`,
+      );
+    }
+  });
+}

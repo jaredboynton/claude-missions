@@ -3,7 +3,7 @@ description: Remove this session from its attached mission's enforcement scope (
 allowed-tools: Bash(node:*), Bash(cat:*), Bash(ls:*), Bash(jq:*), Bash(basename:*), Bash(sed:*), Bash(xargs:*), Bash(head:*), Bash(.:*)
 ---
 
-!`. "${CLAUDE_PLUGIN_ROOT}/scripts/_lib/resolve-sid.sh"; SID=$(resolve_sid); node "${CLAUDE_PLUGIN_ROOT}/scripts/mission-cli.mjs" detach --session-id="${SID}"`
+!`SID=$("${CLAUDE_PLUGIN_ROOT}/scripts/_lib/resolve-sid.sh"); node "${CLAUDE_PLUGIN_ROOT}/scripts/mission-cli.mjs" detach --session-id="${SID}"`
 
 Detach complete. Hooks will no-op for this session going forward.
 

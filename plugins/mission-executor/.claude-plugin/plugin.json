@@ -1,7 +1,7 @@
 {
   "name": "mission",
   "description": "Full autopilot execution of Factory/droid missions: parallel teams, critic-gated completion, zombie detection, external-work reconciliation, and features.json state write-back.",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "author": {
     "name": "Jared Boynton"
   },
