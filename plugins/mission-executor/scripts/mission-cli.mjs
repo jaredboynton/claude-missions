@@ -339,12 +339,24 @@ async function cmdComplete(args) {
       if (!current.attachedSessions?.some((x) => x.sessionId === sid)) {
         const err = new Error("not-attached"); err.exitCode = 3; throw err;
       }
-      if (!force && current.missionPath) {
+      if (current.missionPath) {
         const check = checkCompletion(current.missionPath);
         if (!check.complete) {
-          const err = new Error("completion-gate-unmet"); err.exitCode = 8;
-          err.detail = { reason: check.reason, ...check.detail };
-          throw err;
+          if (!force) {
+            const err = new Error("completion-gate-unmet"); err.exitCode = 8;
+            err.detail = { reason: check.reason, ...check.detail };
+            throw err;
+          }
+          if (force) {
+            process.stderr.write(
+              `\n[FORCE-BYPASS] Mission completion gate unmet:\n` +
+              `  Reason: ${check.reason}\n` +
+              `  Details: ${JSON.stringify(check.detail || {})}\n` +
+              `  This mission is being marked completed despite incomplete validation.\n` +
+              `  This is a policy decision and should be logged for audit purposes.\n\n`
+            );
+            current.forceBypassReason = check.reason;
+          }
         }
       }
       current.active = false;
